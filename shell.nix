@@ -17,6 +17,7 @@ let
         pretty-show
         rio
         megaparsec
+        directory
       ]
     );
   # the dependencies available in the shell

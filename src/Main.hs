@@ -5,36 +5,55 @@
 {-# language TupleSections #-}
 {-# language ApplicativeDo #-}
 
+import Control.Monad.IO.Class
+import System.Directory
+import Control.Monad.Trans.Maybe
+import System.FilePath.Posix
+import Data.Functor
+import Data.DList (DList)
+import qualified Data.DList as DList
+import qualified Data.Map as Map
+import Data.Map (Map)
+
+-- base
+import Control.Applicative hiding (some, many)
+import Control.Arrow ((>>>))
+import Control.Monad
+import Data.Bifunctor (first, second, bimap)
+import qualified Data.Char as Char
+import Data.Function
+import qualified Data.List as List
+import Data.Maybe
+import Data.Tuple (swap)
+import Data.Void
 import Prelude hiding (takeWhile)
 
-import Data.Maybe
-import Control.Monad
-import Control.Applicative hiding (some, many)
-import qualified Data.List as List
-import Data.Function
-import Data.Either
-import Streaming.Process (withStreamingCommand)
-import qualified Streaming.Prelude as S
+-- megaparsec
+import Text.Megaparsec
+import Text.Megaparsec.Char
+
+-- optparse-applicative
+import qualified Options.Applicative as Options
+
+-- streaming
 import qualified Streaming as S
-import Control.Arrow ((>>>), left)
-import Data.Bifunctor (first, second, bimap)
-import qualified Data.Text as Text
-import qualified Data.Text.IO as Text
-import Data.Text (Text)
-import qualified Data.Text.Encoding as Text
-import qualified Data.Char as Char
+import qualified Streaming.Prelude as S
+
+-- streaming-bytestring
 import qualified Data.ByteString.Streaming as SB
 import qualified Data.ByteString.Streaming.Char8 as SB
 
-import Text.Megaparsec
-import Text.Megaparsec.Char
-import Data.Void
-import qualified Data.Text.Lazy.Builder as TextBuilder
-import qualified Data.Text.Lazy as Text (toStrict)
-import Data.Tuple (swap)
+-- streaming-process
+import Streaming.Process (withStreamingCommand)
 
-import qualified Options.Applicative as Options
-import Data.Semigroup
+-- text
+import qualified Data.Text as Text
+import Data.Text (Text)
+import qualified Data.Text.Encoding as Text
+import qualified Data.Text.IO as Text
+import qualified Data.Text.Lazy as Text (toStrict)
+import qualified Data.Text.Lazy.Builder as TextBuilder
+
 
 data Options = Options
   { overwrite :: Bool
@@ -44,7 +63,7 @@ data Options = Options
 options :: Options.Parser Options
 options = do
   overwrite <-
-    [ Options.long "overwite"
+    [ Options.long "overwrite"
     , Options.help "Overwrite the input file"
     ]
     & mconcat
@@ -75,6 +94,16 @@ groupFileImports :: Options -> IO ()
 groupFileImports Options{overwrite, filePath} = do
   fileText <- Text.readFile filePath
 
+  moduleMap <-
+    ( (++)
+        <$> (maybeToList <$>  runMaybeT (localModules filePath))
+        <*> (fromMaybe [] <$> runMaybeT ( projectModules filePath))
+    )
+    <&> reverse
+    <&> concatMap (\(package, modules) -> (,package) <$> modules)
+    <&> Map.fromList
+
+
   let outPutResult =
         if overwrite
           then Text.writeFile filePath
@@ -86,7 +115,7 @@ groupFileImports Options{overwrite, filePath} = do
 
     Right ExtractImports{beforeImports, imports, afterImports} ->
       do groupedImports <-
-            groupImportsByPackage <$> traverse getModuleToPackageMap imports
+            groupImportsByPackage <$> traverse (getModuleToPackageMap moduleMap) imports
          [beforeImports, groupedImports, afterImports] & mconcat & contentToText & outPutResult
 
 contentSplitTrailingBlankLines :: [Content] -> [Content]
@@ -133,7 +162,7 @@ extractImports xs0 =
             AImport _ -> True
             _ -> False
 
-      (beforeImports, xs1) =
+      (before, xs1) =
         xs0
           & List.findIndex matchImport
           & fromMaybe 0
@@ -152,6 +181,11 @@ extractImports xs0 =
                     _ -> Nothing
                 )
               )
+      beforeImports =
+            case (reverse before, imports) of
+                (_, []) -> before
+                (ASingleLineComment _ : reversedBefore, _) -> reverse reversedBefore
+                _ -> before
 
   in ExtractImports{..}
 
@@ -173,7 +207,7 @@ contentToText =
 data Import = Import
   { content :: Text
   , packageName :: Maybe Text
-  , moduleName :: Text
+  , moduleName :: ModuleName
   }
   deriving (Show, Eq, Ord)
 
@@ -259,16 +293,8 @@ parseImport = (<?> "parseImport") $ do
     (<?> "spacesFollowingQualified") $
     Text.pack <$> many spaceChar
 
-  moduleName <-
-    (<?> "moduleName") $
-    Text.intercalate "." <$>
-    sepBy1
-      (do firstCharacter <- upperChar
-          rest <- many (choice [alphaNumChar, char '_'])
-          pure (Text.pack (firstCharacter : rest))
-      )
-      (char '.')
-
+  moduleName@(ModuleName moduleNameText)  <-
+    parseModuleName
 
   restOfLine <-
     (<?> "restOfLine") $
@@ -295,7 +321,7 @@ parseImport = (<?> "parseImport") $ do
               , spacesFollowingPackage
               , fromMaybe "" maybeQualified
               , spacesFollowingQualified
-              , moduleName
+              , moduleNameText
               , restOfLine
               ]
               :  indentedLines
@@ -303,6 +329,17 @@ parseImport = (<?> "parseImport") $ do
       , packageName = maybePackageName
       , moduleName = moduleName
       }
+
+parseModuleName :: Parser ModuleName
+parseModuleName =
+    (<?> "moduleName") $
+    ModuleName . Text.intercalate "." <$>
+    sepBy1
+      (do firstCharacter <- upperChar
+          rest <- many (choice [alphaNumChar, char '_'])
+          pure (Text.pack (firstCharacter : rest))
+      )
+      (char '.')
 
 parseOtherLine :: Parser OtherLine
 parseOtherLine = do
@@ -363,21 +400,26 @@ parsePackageName = parseMaybe (PackageName . dropVersion <$> parser)
                ]
           )
 
-getModuleToPackageMap :: Import -> IO (Import, PackageName)
-getModuleToPackageMap i@Import{moduleName, packageName = Just packageName } = pure (i, PackageName packageName)
-getModuleToPackageMap i@Import{moduleName}=
-  maybe (i, PackageName "") (i,)
-  . listToMaybe
-  . S.fst'
-  <$> withStreamingCommand
-        ("ghc-pkg find-module " <> Text.unpack moduleName)
-        SB.empty
-        ( SB.lines
-            >>> S.mapped (SB.foldlChunks (<>) "")
-            >>> S.mapMaybe (parsePackageName . Text.decodeUtf8)
-            >>> S.hoist SB.effects
-            >>> S.toList
-        )
+getModuleToPackageMap :: Map ModuleName PackageName -> Import -> IO (Import, PackageName)
+getModuleToPackageMap _ i@Import{packageName = Just packageName } = pure (i, PackageName packageName)
+getModuleToPackageMap localModules_ i@Import{moduleName}
+  | Just (PackageName packageName)
+      <- Map.lookup moduleName localModules_
+      = pure (i, PackageName packageName)
+
+  | otherwise =
+      maybe (i, PackageName "") (i,)
+      . listToMaybe
+      . S.fst'
+      <$> withStreamingCommand
+            ("ghc-pkg find-module " <> Text.unpack (unModuleName moduleName))
+            SB.empty
+            ( SB.lines
+                >>> S.mapped (SB.foldlChunks (<>) "")
+                >>> S.mapMaybe (parsePackageName . Text.decodeUtf8)
+                >>> S.hoist SB.effects
+                >>> S.toList
+            )
 
 groupImportsByPackage :: [(Import, PackageName)] -> [Content]
 groupImportsByPackage =
@@ -392,3 +434,100 @@ groupImportsByPackage =
       )
     >>> List.intersperse [ABlankLine (BlankLine "")]
     >>> List.concat
+
+findEnclosingFile :: (MonadIO m, MonadPlus m) => (FilePath -> Bool) -> FilePath -> m FilePath
+findEnclosingFile fileMatcher =  liftIO . canonicalizePath >=> go
+  where
+    go filePath = do
+      liftIO (doesPathExist filePath) >>= guard
+
+      let tryPath = do
+            liftIO (doesDirectoryExist filePath) >>= guard
+            liftIO (listDirectory filePath)
+              <&> List.filter fileMatcher
+              <&> listToMaybe
+              <&> fmap (filePath</>)
+              >>= maybe mzero pure
+
+          ascendToParent = do
+            let parentDir = takeDirectory filePath
+            guard (parentDir /= filePath)
+            go parentDir
+
+      tryPath <|> ascendToParent
+
+byExtension :: String -> FilePath -> Bool
+byExtension extension = and . sequence [isExtensionOf extension, not . List.null . takeBaseName]
+
+newtype ModuleName = ModuleName {unModuleName :: Text} deriving (Show, Eq, Ord)
+
+projectModules :: (MonadIO m, MonadPlus m) => FilePath -> m [(PackageName, [ModuleName])]
+projectModules filePath = do
+  cabalProjectFile <-
+    findEnclosingFile (("cabal.project"==) . takeFileName) filePath
+
+  cabalFiles <-
+    gatherFiles ".cabal" (takeDirectory cabalProjectFile)
+
+  traverse localModules cabalFiles
+
+
+localModules :: (MonadIO m, MonadPlus m) => FilePath -> m (PackageName, [ModuleName])
+localModules filePath = do
+  cabalFile <-
+    findEnclosingFile (byExtension ".cabal") filePath
+
+  modules <-
+    gatherFiles ".hs" (takeDirectory cabalFile)
+    >>= traverse (liftIO . Text.readFile)
+    <&> mapMaybe (either (const Nothing) Just . parse parseModuleAndModuleName "")
+
+  pure
+    ( PackageName
+        . Text.pack
+        . takeBaseName
+        $ cabalFile
+    , modules
+    )
+
+gatherFiles :: (MonadIO m) => String -> FilePath -> m [FilePath]
+gatherFiles extension =
+  liftIO . canonicalizePath >=> fmap DList.toList  . go
+  where
+    go :: (MonadIO n) => FilePath -> n (DList FilePath)
+    go filePath =
+      fmap (fromMaybe DList.empty)
+        . runMaybeT
+        $ do
+          liftIO (doesPathExist filePath) >>= guard
+
+          filePath
+            & takeFileName
+            & not . List.isPrefixOf "."
+            & guard
+
+          let descendDirectory = do
+                liftIO (doesDirectoryExist filePath) >>= guard
+                liftIO (listDirectory filePath)
+                  <&> map (filePath </>)
+                  >>= traverse go
+                  <&> mconcat
+
+              checkFile = do
+                filePath
+                  & byExtension extension
+                  & guard
+                pure (DList.singleton filePath)
+
+          descendDirectory <|> checkFile
+
+parseModuleAndModuleName :: Parser ModuleName
+parseModuleAndModuleName = moduleName <|> (restOfLine >> parseModuleAndModuleName)
+  where
+    moduleName =
+        string "module"
+         >> some spaceChar
+         >> parseModuleName
+
+    restOfLine =
+      (<?> "restOfLine") $ manyTill printChar (void eol)

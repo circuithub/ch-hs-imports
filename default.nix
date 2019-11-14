@@ -1,5 +1,6 @@
-{ mkDerivation, base, megaparsec, optparse-applicative, stdenv
-, streaming, streaming-bytestring, streaming-process, text
+{ mkDerivation, base, containers, directory, dlist, filepath
+, megaparsec, optparse-applicative, stdenv, streaming
+, streaming-bytestring, streaming-process, text, transformers
 }:
 mkDerivation {
   pname = "ch-hs-imports";
@@ -8,8 +9,9 @@ mkDerivation {
   isLibrary = false;
   isExecutable = true;
   executableHaskellDepends = [
-    base megaparsec optparse-applicative streaming streaming-bytestring
-    streaming-process text
+    base containers directory dlist filepath megaparsec
+    optparse-applicative streaming streaming-bytestring
+    streaming-process text transformers
   ];
   license = stdenv.lib.licenses.mit;
 }
