@@ -8,17 +8,14 @@
 import Prelude hiding (takeWhile)
 
 import Data.Maybe
-import System.Process
 import Control.Monad
 import Control.Applicative hiding (some, many)
 import qualified Data.List as List
 import Data.Function
 import Data.Either
-import System.IO (hGetContents)
 import Streaming.Process (withStreamingCommand)
 import qualified Streaming.Prelude as S
 import qualified Streaming as S
-import Control.Monad.Trans
 import Control.Arrow ((>>>), left)
 import Data.Bifunctor (first, second, bimap)
 import qualified Data.Text as Text
@@ -26,13 +23,6 @@ import qualified Data.Text.IO as Text
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
 import qualified Data.Char as Char
-import qualified Data.List.NonEmpty as NonEmpty
-import Data.List.NonEmpty (NonEmpty)
-import qualified Data.Map as Map
-import Data.Map (Map)
-import qualified Data.Map.Monoidal as MonoidalMap
-import Data.Map.Monoidal (MonoidalMap)
-import Text.Show.Pretty (ppShow)
 import qualified Data.ByteString.Streaming as SB
 import qualified Data.ByteString.Streaming.Char8 as SB
 

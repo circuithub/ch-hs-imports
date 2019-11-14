@@ -23,6 +23,7 @@ let
   dependencies = with pkgs;[
     # tools
     ghc
+    cabal-install
   ];
   # fake package explicitly adding dependencies to all the shell dependencies for adding GC roots
   pathToDependencies = pkgs.runCommand "build" {
