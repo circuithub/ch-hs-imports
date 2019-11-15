@@ -5,28 +5,37 @@
 {-# language TupleSections #-}
 {-# language ApplicativeDo #-}
 
-import Control.Monad.IO.Class
-import System.Directory
-import Control.Monad.Trans.Maybe
-import System.FilePath.Posix
-import Data.Functor
-import Data.DList (DList)
-import qualified Data.DList as DList
-import qualified Data.Map as Map
-import Data.Map (Map)
-
 -- base
 import Control.Applicative hiding (some, many)
+import qualified Control.Applicative as Applicative
 import Control.Arrow ((>>>))
 import Control.Monad
+import Control.Monad.IO.Class
 import Data.Bifunctor (first, second, bimap)
 import qualified Data.Char as Char
+import Data.Foldable
 import Data.Function
+import Data.Functor
 import qualified Data.List as List
 import Data.Maybe
 import Data.Tuple (swap)
 import Data.Void
 import Prelude hiding (takeWhile)
+import System.IO (stderr, hPutStrLn)
+
+-- containers
+import qualified Data.Map as Map
+import Data.Map (Map)
+
+-- directory
+import System.Directory
+
+-- dlist
+import Data.DList (DList)
+import qualified Data.DList as DList
+
+-- filepath
+import System.FilePath.Posix
 
 -- megaparsec
 import Text.Megaparsec
@@ -54,10 +63,16 @@ import qualified Data.Text.IO as Text
 import qualified Data.Text.Lazy as Text (toStrict)
 import qualified Data.Text.Lazy.Builder as TextBuilder
 
+-- transformers
+import Control.Monad.Trans.Maybe
+
 
 data Options = Options
   { overwrite :: Bool
-  , filePath :: String
+  , localModulesFromCurrentDir :: Bool
+  , modulesFromAllGhcPkgs :: Bool
+  , reportProgress :: Bool
+  , filePaths :: [String]
   }
 
 options :: Options.Parser Options
@@ -69,12 +84,35 @@ options = do
     & mconcat
     & Options.switch
 
-  filePath <-
-    [ Options.metavar "FILE"
-    , Options.help "The file whose imports will be grouped"
+  localModulesFromCurrentDir <-
+    [ Options.long "local-modules-from-current-dir"
+    , Options.help "Get the local modules from the current directory once and not each time relative to each file."
+    ]
+    & mconcat
+    & Options.switch
+
+  modulesFromAllGhcPkgs <-
+    [ Options.long "modules-from-all-ghc-pkgs"
+    , Options.help "Get the module set once at the start from all the packages registered with ghc. A lot faster."
+    ]
+    & mconcat
+    & Options.switch
+
+
+  reportProgress <-
+    [ Options.long "report-progress"
+    , Options.help "When doing multiple files report progress along the way"
+    ]
+    & mconcat
+    & Options.switch
+
+  filePaths <-
+    [ Options.metavar "FILES..."
+    , Options.help "The files whose imports will be grouped"
     ]
     & mconcat
     & Options.argument Options.str
+    & Applicative.some
 
   pure Options {..}
 
@@ -91,32 +129,86 @@ main =
           )
 
 groupFileImports :: Options -> IO ()
-groupFileImports Options{overwrite, filePath} = do
-  fileText <- Text.readFile filePath
+groupFileImports
+  Options
+    { overwrite
+    , localModulesFromCurrentDir
+    , modulesFromAllGhcPkgs
+    , reportProgress
+    , filePaths
+    } = do
 
-  moduleMap <-
-    ( (++)
-        <$> (maybeToList <$>  runMaybeT (localModules filePath))
-        <*> (fromMaybe [] <$> runMaybeT ( projectModules filePath))
-    )
-    <&> reverse
-    <&> concatMap (\(package, modules) -> (,package) <$> modules)
-    <&> Map.fromList
+  when
+    reportProgress
+    (putStrLn $ "processing " ++ show (length filePaths) ++ " number of files.")
 
+  globalModulesFromAllGhcPackages <-
+    if modulesFromAllGhcPkgs
+      then
+        getModuleMapFromGhc
+        <* when
+            reportProgress
+            (putStrLn "got all exposed modules from GHC package set")
+      else pure Map.empty
 
-  let outPutResult =
-        if overwrite
-          then Text.writeFile filePath
-          else Text.putStr
+  localModulesCWD <-
+    if localModulesFromCurrentDir
+      then
+          ( projectModules "./"
+              & runMaybeT
+              <&> fromMaybe []
+              <&> concatMap (\(package, modules) -> (,package) <$> modules)
+              <&> Map.fromList
+          )
+          <* when
+              reportProgress
+              (putStrLn "got all local modules from current working directory")
+      else
+        pure Map.empty
 
-  case second (extractImports . contentSplitTrailingBlankLines) $ parse parseConent filePath fileText of
-    Left e ->
-      fail $ "Failed parsing: \n" ++ show e
+  for_ filePaths $ \filePath -> do
+    fileText <- Text.readFile filePath
 
-    Right ExtractImports{beforeImports, imports, afterImports} ->
-      do groupedImports <-
-            groupImportsByPackage <$> traverse (getModuleToPackageMap moduleMap) imports
-         [beforeImports, groupedImports, afterImports] & mconcat & contentToText & outPutResult
+    moduleMap <-
+      ( if localModulesFromCurrentDir
+         then
+           pure localModulesCWD
+
+         else
+           ( ( (++)
+                 <$> (maybeToList <$>  runMaybeT (localModules filePath))
+                 <*> (fromMaybe [] <$> runMaybeT ( projectModules filePath))
+             )
+             <&> reverse
+             <&> concatMap (\(package, modules) -> (,package) <$> modules)
+             <&> Map.fromList
+           )
+          <* when
+              reportProgress
+              (putStrLn $ "got local modules relative to file path: " ++ filePath)
+
+      ) <&> (`Map.union` globalModulesFromAllGhcPackages)
+
+    let outPutResult =
+          if overwrite
+            then \newFileText ->
+                    when
+                      (newFileText /= fileText)
+                      (Text.writeFile filePath newFileText)
+            else Text.putStr
+
+    case second (extractImports . contentSplitTrailingBlankLines) $ parse parseConent filePath fileText of
+      Left e ->
+        hPutStrLn stderr (unlines ["Failed parsing:", errorBundlePretty e, "for file: "  ++ filePath])
+
+      Right ExtractImports{beforeImports, imports, afterImports} ->
+        do groupedImports <-
+              groupImportsByPackage <$> traverse (getModuleToPackageMap moduleMap) imports
+           [beforeImports, groupedImports, afterImports] & mconcat & contentToText & outPutResult
+
+    when
+      reportProgress
+      (putStrLn $ "finished: " ++ filePath)
 
 contentSplitTrailingBlankLines :: [Content] -> [Content]
 contentSplitTrailingBlankLines =
@@ -184,7 +276,8 @@ extractImports xs0 =
       beforeImports =
             case (reverse before, imports) of
                 (_, []) -> before
-                (ASingleLineComment _ : reversedBefore, _) -> reverse reversedBefore
+                ([ASingleLineComment _], _) -> []
+                (ASingleLineComment _ : reversedBefore, _) -> reverse (ABlankLine (BlankLine "") : reversedBefore)
                 _ -> before
 
   in ExtractImports{..}
@@ -251,8 +344,7 @@ parseSingleLineComment = (<?> "parseSingleLineComment") $ do
     string "--"
 
   restOfLine <-
-    (<?> "restOfLine") $
-    Text.pack <$> someTill printChar (void eol)
+    parseRestOfLine
 
   pure (SingleLineComment (mconcat [spacesBefore, commentStart, restOfLine]))
 
@@ -273,6 +365,15 @@ parseImport = (<?> "parseImport") $ do
     (<?> "spacesFollowingImport") $
     Text.pack <$> some spaceChar
 
+
+  maybeQualified <-
+    (<?> "maybeQualified") $
+    try (Just <$> string "qualified") <|> pure Nothing
+
+  spacesFollowingQualified <-
+    (<?> "spacesFollowingQualified") $
+    Text.pack <$> many spaceChar
+
   maybePackageName <-
     (<?> "maybePackageName") $
     try
@@ -285,27 +386,18 @@ parseImport = (<?> "parseImport") $ do
     (<?> "spacesFollowingPackage") $
     Text.pack <$> many spaceChar
 
-  maybeQualified <-
-    (<?> "maybeQualified") $
-    try (Just <$> string "qualified") <|> pure Nothing
-
-  spacesFollowingQualified <-
-    (<?> "spacesFollowingQualified") $
-    Text.pack <$> many spaceChar
-
   moduleName@(ModuleName moduleNameText)  <-
     parseModuleName
 
   restOfLine <-
-    (<?> "restOfLine") $
-    Text.pack <$> manyTill printChar (void eol)
+    parseRestOfLine
 
   indentedLines <-
     (<?> "indentedLines") $
     many $ try $
       (do
         spacesAtStartOfLine <- Text.pack <$> some (notFollowedBy  eol >> spaceChar)
-        restOfIndentedLine <- Text.pack <$> manyTill printChar (void eol)
+        restOfIndentedLine <- parseRestOfLine
         pure (spacesAtStartOfLine <> restOfIndentedLine)
       ) <|> ("" <$ eol)
 
@@ -317,10 +409,10 @@ parseImport = (<?> "parseImport") $ do
             (mconcat
               [ textImport
               , spacesFollowingImport
-              , fromMaybe "" maybePackageName
-              , spacesFollowingPackage
               , fromMaybe "" maybeQualified
               , spacesFollowingQualified
+              , fromMaybe "" maybePackageName
+              , spacesFollowingPackage
               , moduleNameText
               , restOfLine
               ]
@@ -353,11 +445,8 @@ parseOtherLine = do
       ]
     )
 
-  restOfLine <-
-    (<?> "restOfLine") $
-    Text.pack <$> someTill printChar (void eol)
+  OtherLine <$> parseRestOfLine
 
-  pure (OtherLine restOfLine)
 
 bol :: Parser ()
 bol = (<?> "bol") $ do
@@ -367,38 +456,16 @@ bol = (<?> "bol") $ do
 
 newtype PackageName = PackageName {getPackageName :: Text} deriving (Eq, Ord, Show)
 
-parsePackageName :: Text -> Maybe PackageName
-parsePackageName = parseMaybe (PackageName . dropVersion <$> parser)
-  where
-    dropVersion :: Text -> Text
-    dropVersion t =
-      let idx =
-            t
-              & Text.reverse
-              & Text.findIndex ('-' ==)
-              & fromMaybe 1
-              & (\i -> Text.length t - i - 1)
+dropPackageVersion :: Text -> Text
+dropPackageVersion t =
+  let idx =
+        t
+          & Text.reverse
+          & Text.findIndex ('-' ==)
+          & fromMaybe 1
+          & (\i -> Text.length t - i - 1)
 
-      in t & Text.splitAt idx & fst
-
-    parser :: Parser Text
-    parser =
-      Text.cons
-        <$> (space >> satisfy Char.isAlpha <?> "Must start with alpha character")
-        <*>  nameP
-        <* (space >> eof <?> "may not have any characters following it")
-
-    nameP =
-        takeWhile1P
-          Nothing
-          ( or
-             . sequence
-               [ Char.isAlphaNum
-               , (=='_')
-               , (=='-')
-               , (=='.')
-               ]
-          )
+  in t & Text.splitAt idx & fst
 
 getModuleToPackageMap :: Map ModuleName PackageName -> Import -> IO (Import, PackageName)
 getModuleToPackageMap _ i@Import{packageName = Just packageName } = pure (i, PackageName packageName)
@@ -412,11 +479,11 @@ getModuleToPackageMap localModules_ i@Import{moduleName}
       . listToMaybe
       . S.fst'
       <$> withStreamingCommand
-            ("ghc-pkg find-module " <> Text.unpack (unModuleName moduleName))
+            ("ghc-pkg find-module " <> Text.unpack (unModuleName moduleName) <> " --simple-output")
             SB.empty
-            ( SB.lines
+            ( SB.words
                 >>> S.mapped (SB.foldlChunks (<>) "")
-                >>> S.mapMaybe (parsePackageName . Text.decodeUtf8)
+                >>> S.map (PackageName . dropPackageVersion . Text.decodeUtf8)
                 >>> S.hoist SB.effects
                 >>> S.toList
             )
@@ -522,12 +589,47 @@ gatherFiles extension =
           descendDirectory <|> checkFile
 
 parseModuleAndModuleName :: Parser ModuleName
-parseModuleAndModuleName = moduleName <|> (restOfLine >> parseModuleAndModuleName)
+parseModuleAndModuleName = moduleName <|> (parseRestOfLine >> parseModuleAndModuleName)
   where
     moduleName =
         string "module"
          >> some spaceChar
          >> parseModuleName
 
-    restOfLine =
-      (<?> "restOfLine") $ manyTill printChar (void eol)
+
+getModuleMapFromGhc :: IO (Map ModuleName PackageName)
+getModuleMapFromGhc =
+  getPackagesFromGhc
+    >>= traverse (\packageName -> map (, packageName) <$> getPackageModulesFromGhc packageName)
+    <&> Map.fromList . concat
+
+
+getPackagesFromGhc :: IO [PackageName]
+getPackagesFromGhc =
+  S.fst'
+    <$> withStreamingCommand
+          "ghc-pkg list --simple-output"
+          SB.empty
+          ( SB.words
+              >>> S.mapped (SB.foldlChunks (<>) "")
+              >>> S.map (PackageName . dropPackageVersion . Text.decodeUtf8)
+              >>> S.hoist SB.effects
+              >>> S.toList
+            )
+
+getPackageModulesFromGhc :: PackageName -> IO [ModuleName]
+getPackageModulesFromGhc (PackageName packageName)=
+  S.fst'
+    <$> withStreamingCommand
+          ("ghc-pkg field " <> Text.unpack packageName <> " exposed-modules --simple-output")
+          SB.empty
+          ( SB.words
+              >>> S.mapped (SB.foldlChunks (<>) "")
+              >>> S.map (ModuleName . Text.decodeUtf8)
+              >>> S.hoist SB.effects
+              >>> S.toList
+            )
+
+parseRestOfLine :: Parser Text
+parseRestOfLine =
+      (<?> "restOfLine") $ Text.pack <$> manyTill (printChar <|> char '\t') (void eol)
