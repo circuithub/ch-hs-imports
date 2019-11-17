@@ -18,6 +18,7 @@ let
         rio
         megaparsec
         directory
+        async
       ]
     );
   # the dependencies available in the shell

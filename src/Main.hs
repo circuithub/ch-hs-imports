@@ -1,4 +1,5 @@
 {-# language OverloadedStrings #-}
+{-# language FlexibleContexts #-}
 {-# language LambdaCase #-}
 {-# language RecordWildCards #-}
 {-# language NamedFieldPuns #-}
@@ -23,6 +24,11 @@ import Data.Void
 import Prelude hiding (takeWhile)
 import System.IO (stderr, hPutStrLn)
 
+import Control.Concurrent.Async (mapConcurrently, forConcurrently_)
+import Control.Monad.IO.Unlift
+
+
+
 -- containers
 import qualified Data.Map as Map
 import Data.Map (Map)
@@ -31,7 +37,6 @@ import Data.Map (Map)
 import System.Directory
 
 -- dlist
-import Data.DList (DList)
 import qualified Data.DList as DList
 
 -- filepath
@@ -117,9 +122,9 @@ options = do
   pure Options {..}
 
 main :: IO ()
-main =
-  groupFileImports
-    =<< Options.execParser
+main = do
+  porgramOptions <-
+     Options.execParser
           ( [ Options.fullDesc
             , Options.progDesc "Group imports by package"
             , Options.header "Group imports by package"
@@ -128,7 +133,13 @@ main =
             & Options.info (options <**> Options.helper)
           )
 
-groupFileImports :: Options -> IO ()
+  groupFileImports porgramOptions
+
+
+groupFileImports
+  :: ( MonadUnliftIO m
+     )
+  => Options -> m ()
 groupFileImports
   Options
     { overwrite
@@ -140,7 +151,7 @@ groupFileImports
 
   when
     reportProgress
-    (putStrLn $ "processing " ++ show (length filePaths) ++ " number of files.")
+    (liftIO $ putStrLn  $ "processing " ++ show (length filePaths) ++ " number of files.")
 
   globalModulesFromAllGhcPackages <-
     if modulesFromAllGhcPkgs
@@ -148,27 +159,25 @@ groupFileImports
         getModuleMapFromGhc
         <* when
             reportProgress
-            (putStrLn "got all exposed modules from GHC package set")
+            (liftIO $ putStrLn "got all exposed modules from GHC package set")
       else pure Map.empty
 
   localModulesCWD <-
     if localModulesFromCurrentDir
       then
           ( projectModules "./"
-              & runMaybeT
-              <&> fromMaybe []
               <&> concatMap (\(package, modules) -> (,package) <$> modules)
               <&> Map.fromList
           )
           <* when
               reportProgress
-              (putStrLn "got all local modules from current working directory")
+              (liftIO $ putStrLn "got all local modules from current working directory")
       else
         pure Map.empty
 
-  for_ filePaths $ \filePath -> do
-    fileText <- Text.readFile filePath
-
+  runInIO <- askRunInIO
+  liftIO $ forConcurrently_  filePaths $ \filePath -> runInIO $ do
+    fileText <- liftIO $ Text.readFile filePath
     moduleMap <-
       ( if localModulesFromCurrentDir
          then
@@ -176,8 +185,8 @@ groupFileImports
 
          else
            ( ( (++)
-                 <$> (maybeToList <$>  runMaybeT (localModules filePath))
-                 <*> (fromMaybe [] <$> runMaybeT ( projectModules filePath))
+                 <$> (maybeToList <$>  localModules filePath)
+                 <*> projectModules filePath
              )
              <&> reverse
              <&> concatMap (\(package, modules) -> (,package) <$> modules)
@@ -185,7 +194,7 @@ groupFileImports
            )
           <* when
               reportProgress
-              (putStrLn $ "got local modules relative to file path: " ++ filePath)
+              (liftIO $ putStrLn $ "got local modules relative to file path: " ++ filePath)
 
       ) <&> (`Map.union` globalModulesFromAllGhcPackages)
 
@@ -199,16 +208,18 @@ groupFileImports
 
     case second (extractImports . contentSplitTrailingBlankLines) $ parse parseConent filePath fileText of
       Left e ->
-        hPutStrLn stderr (unlines ["Failed parsing:", errorBundlePretty e, "for file: "  ++ filePath])
+        liftIO $ hPutStrLn stderr (unlines ["Failed parsing:", errorBundlePretty e, "for file: "  ++ filePath])
 
       Right ExtractImports{beforeImports, imports, afterImports} ->
         do groupedImports <-
-              groupImportsByPackage <$> traverse (getModuleToPackageMap moduleMap) imports
-           [beforeImports, groupedImports, afterImports] & mconcat & contentToText & outPutResult
+              liftIO$ groupImportsByPackage <$> traverse (getModuleToPackageMap moduleMap) imports
+
+           [beforeImports, groupedImports, afterImports] & mconcat & contentToText & outPutResult & liftIO
 
     when
       reportProgress
-      (putStrLn $ "finished: " ++ filePath)
+      (liftIO $ putStrLn $ "finished: " ++ filePath)
+
 
 contentSplitTrailingBlankLines :: [Content] -> [Content]
 contentSplitTrailingBlankLines =
@@ -502,8 +513,11 @@ groupImportsByPackage =
     >>> List.intersperse [ABlankLine (BlankLine "")]
     >>> List.concat
 
-findEnclosingFile :: (MonadIO m, MonadPlus m) => (FilePath -> Bool) -> FilePath -> m FilePath
-findEnclosingFile fileMatcher =  liftIO . canonicalizePath >=> go
+findEnclosingFile
+  :: ( MonadIO m
+     )
+  => (FilePath -> Bool) -> FilePath -> m (Maybe FilePath)
+findEnclosingFile fileMatcher =  liftIO . canonicalizePath >=> runMaybeT . go
   where
     go filePath = do
       liftIO (doesPathExist filePath) >>= guard
@@ -528,41 +542,60 @@ byExtension extension = and . sequence [isExtensionOf extension, not . List.null
 
 newtype ModuleName = ModuleName {unModuleName :: Text} deriving (Show, Eq, Ord)
 
-projectModules :: (MonadIO m, MonadPlus m) => FilePath -> m [(PackageName, [ModuleName])]
+projectModules
+  :: ( MonadUnliftIO m
+     )
+  => FilePath -> m [(PackageName, [ModuleName])]
 projectModules filePath = do
-  cabalProjectFile <-
+  mcabalProjectFile <-
     findEnclosingFile (("cabal.project"==) . takeFileName) filePath
 
-  cabalFiles <-
-    gatherFiles ".cabal" (takeDirectory cabalProjectFile)
+  case mcabalProjectFile of
+    Just cabalProjectFile -> do
+      cabalFiles <-
+        gatherFiles ".cabal" (takeDirectory cabalProjectFile)
 
-  traverse localModules cabalFiles
+      traverse localModules cabalFiles <&> catMaybes
+
+    Nothing ->
+      pure []
 
 
-localModules :: (MonadIO m, MonadPlus m) => FilePath -> m (PackageName, [ModuleName])
+localModules
+  :: ( MonadUnliftIO m
+     )
+  => FilePath -> m (Maybe (PackageName, [ModuleName]))
 localModules filePath = do
-  cabalFile <-
+  mcabalFile <-
     findEnclosingFile (byExtension ".cabal") filePath
 
-  modules <-
-    gatherFiles ".hs" (takeDirectory cabalFile)
-    >>= traverse (liftIO . Text.readFile)
-    <&> mapMaybe (either (const Nothing) Just . parse parseModuleAndModuleName "")
+  case mcabalFile of
+    Just cabalFile -> do
+      modules <-
+        gatherFiles ".hs" (takeDirectory cabalFile)
+        >>= liftIO . mapConcurrently (fmap (either (const Nothing) Just . parse parseModuleAndModuleName "") . Text.readFile)
+        <&> catMaybes
 
-  pure
-    ( PackageName
-        . Text.pack
-        . takeBaseName
-        $ cabalFile
-    , modules
-    )
+      pure $ Just
+        ( PackageName
+            . Text.pack
+            . takeBaseName
+            $ cabalFile
+        , modules
+        )
 
-gatherFiles :: (MonadIO m) => String -> FilePath -> m [FilePath]
+    Nothing ->
+      pure Nothing
+
+gatherFiles
+  :: ( MonadUnliftIO m
+     )
+  => String -> FilePath -> m [FilePath]
 gatherFiles extension =
   liftIO . canonicalizePath >=> fmap DList.toList  . go
   where
-    go :: (MonadIO n) => FilePath -> n (DList FilePath)
-    go filePath =
+    go filePath = do
+      runInIO <- askRunInIO
       fmap (fromMaybe DList.empty)
         . runMaybeT
         $ do
@@ -577,7 +610,7 @@ gatherFiles extension =
                 liftIO (doesDirectoryExist filePath) >>= guard
                 liftIO (listDirectory filePath)
                   <&> map (filePath </>)
-                  >>= traverse go
+                  >>= liftIO . mapConcurrently  (runInIO . go)
                   <&> mconcat
 
               checkFile = do
@@ -597,10 +630,13 @@ parseModuleAndModuleName = moduleName <|> (parseRestOfLine >> parseModuleAndModu
          >> parseModuleName
 
 
-getModuleMapFromGhc :: IO (Map ModuleName PackageName)
+getModuleMapFromGhc
+  :: ( MonadUnliftIO m
+     )
+  => m (Map ModuleName PackageName)
 getModuleMapFromGhc =
-  getPackagesFromGhc
-    >>= traverse (\packageName -> map (, packageName) <$> getPackageModulesFromGhc packageName)
+  liftIO getPackagesFromGhc
+    >>= liftIO . mapConcurrently (\packageName -> map (, packageName) <$> getPackageModulesFromGhc packageName)
     <&> Map.fromList . concat
 
 
