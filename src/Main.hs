@@ -5,6 +5,7 @@
 {-# language NamedFieldPuns #-}
 {-# language TupleSections #-}
 {-# language ApplicativeDo #-}
+{-# language DuplicateRecordFields #-}
 
 -- base
 import Control.Applicative hiding (some, many)
@@ -27,11 +28,12 @@ import System.IO (stderr, hPutStrLn)
 import Control.Concurrent.Async (mapConcurrently, forConcurrently_)
 import Control.Monad.IO.Unlift
 
+import Data.Map.Monoidal (MonoidalMap)
+import qualified Data.Map.Monoidal as MonoidalMap
+import Data.List.NonEmpty (NonEmpty, NonEmpty((:|)))
+import qualified Data.List.NonEmpty as NonEmpty
 
 
--- containers
-import qualified Data.Map as Map
-import Data.Map (Map)
 
 -- directory
 import System.Directory
@@ -160,23 +162,21 @@ groupFileImports
         <* when
             reportProgress
             (liftIO $ putStrLn "got all exposed modules from GHC package set")
-      else pure Map.empty
+      else pure MonoidalMap.empty
 
   localModulesCWD <-
     if localModulesFromCurrentDir
       then
-          ( projectModules "./"
-              <&> concatMap (\(package, modules) -> (,package) <$> modules)
-              <&> Map.fromList
-          )
+          projectModules "./"
           <* when
               reportProgress
               (liftIO $ putStrLn "got all local modules from current working directory")
       else
-        pure Map.empty
+        pure MonoidalMap.empty
 
   runInIO <- askRunInIO
   liftIO $ forConcurrently_  filePaths $ \filePath -> runInIO $ do
+    absoluteFilePath_ <- absoluteFilePath filePath
     fileText <- liftIO $ Text.readFile filePath
     moduleMap <-
       ( if localModulesFromCurrentDir
@@ -184,19 +184,15 @@ groupFileImports
            pure localModulesCWD
 
          else
-           ( ( (++)
-                 <$> (maybeToList <$>  localModules filePath)
-                 <*> projectModules filePath
-             )
-             <&> reverse
-             <&> concatMap (\(package, modules) -> (,package) <$> modules)
-             <&> Map.fromList
+           ( (<>)
+               <$> localModules filePath
+               <*> projectModules filePath
            )
           <* when
               reportProgress
               (liftIO $ putStrLn $ "got local modules relative to file path: " ++ filePath)
 
-      ) <&> (`Map.union` globalModulesFromAllGhcPackages)
+      ) <&> (<> globalModulesFromAllGhcPackages)
 
     let outPutResult =
           if overwrite
@@ -212,7 +208,7 @@ groupFileImports
 
       Right ExtractImports{beforeImports, imports, afterImports} ->
         do groupedImports <-
-              liftIO$ groupImportsByPackage <$> traverse (getModuleToPackageMap moduleMap) imports
+              liftIO $ groupImportsByPackage <$> traverse (determineModulePackage absoluteFilePath_ moduleMap) imports
 
            [beforeImports, groupedImports, afterImports] & mconcat & contentToText & outPutResult & liftIO
 
@@ -464,8 +460,22 @@ bol = (<?> "bol") $ do
   pos <- sourceColumn <$> getSourcePos
   guard (pos == pos1)
 
+data LocalPackage = LocalPackage
+  { packageName :: PackageName
+  , pathToCabalFile :: AbsoluteFilePath
+  } deriving (Show, Eq, Ord)
+
+data PackageSource
+  = ALocalPackage LocalPackage
+  | AGlobalPackage PackageName
+  deriving (Show, Eq, Ord)
 
 newtype PackageName = PackageName {getPackageName :: Text} deriving (Eq, Ord, Show)
+
+packageNameFromSource :: PackageSource -> PackageName
+packageNameFromSource = \case
+  AGlobalPackage packageName ->  packageName
+  ALocalPackage LocalPackage{packageName} ->  packageName
 
 dropPackageVersion :: Text -> Text
 dropPackageVersion t =
@@ -478,12 +488,12 @@ dropPackageVersion t =
 
   in t & Text.splitAt idx & fst
 
-getModuleToPackageMap :: Map ModuleName PackageName -> Import -> IO (Import, PackageName)
-getModuleToPackageMap _ i@Import{packageName = Just packageName } = pure (i, PackageName packageName)
-getModuleToPackageMap localModules_ i@Import{moduleName}
-  | Just (PackageName packageName)
-      <- Map.lookup moduleName localModules_
-      = pure (i, PackageName packageName)
+determineModulePackage :: AbsoluteFilePath -> MonoidalMap ModuleName (NonEmpty PackageSource) -> Import -> IO (Import, PackageName)
+determineModulePackage _ _ i@Import{packageName = Just packageName } = pure (i, PackageName packageName)
+determineModulePackage absoluteFilePath_ localModules_ i@Import{moduleName}
+  | Just inPackageMap
+      <- MonoidalMap.lookup moduleName localModules_
+      = pure (i, pickPackage absoluteFilePath_ inPackageMap)
 
   | otherwise =
       maybe (i, PackageName "") (i,)
@@ -499,27 +509,64 @@ getModuleToPackageMap localModules_ i@Import{moduleName}
                 >>> S.toList
             )
 
+pickPackage :: AbsoluteFilePath -> NonEmpty PackageSource -> PackageName
+pickPackage (AbsoluteFilePath filePath)= \case
+  (matchOnePackage :| []) ->
+    packageNameFromSource matchOnePackage
+
+  -- for now when there are multiple matches don't do anything fancy
+  --  * if the file path matches a single local package pick that
+  --  * otherwise be deterministic by picking first one after sorting the matches
+  manyMatches ->
+    let oneBestLocalMatch =
+          manyMatches
+            & NonEmpty.filter
+                (\case
+                    AGlobalPackage _ ->
+                      False
+
+                    ALocalPackage
+                      LocalPackage
+                        {pathToCabalFile = AbsoluteFilePath pathToCabalFile } ->
+                      List.isPrefixOf (takeDirectory pathToCabalFile) filePath
+                )
+            & \case
+                [x] -> Just (packageNameFromSource x)
+                _ -> Nothing
+
+
+
+        fallBackMatch =
+          manyMatches
+            & NonEmpty.sort
+            & NonEmpty.head
+            & packageNameFromSource
+
+    in fromMaybe fallBackMatch  oneBestLocalMatch
+
 groupImportsByPackage :: [(Import, PackageName)] -> [Content]
-groupImportsByPackage =
-  List.sortOn snd
-    >>> List.groupBy ((==) `on` snd)
-    >>> map (List.sortOn (moduleName . fst))
-    >>> map
-      (\((h, PackageName packageName):t) ->
-        ASingleLineComment (SingleLineComment ("-- " <> packageName))
-        : AImport h
-        : map (AImport . fst) t
-      )
-    >>> List.intersperse [ABlankLine (BlankLine "")]
-    >>> List.concat
+groupImportsByPackage = maybe [] go . NonEmpty.nonEmpty
+  where
+    go =
+      NonEmpty.sortBy (compare `on` snd)
+        >>> NonEmpty.groupBy ((==) `on` snd)
+        >>> fmap (NonEmpty.sortBy (compare `on` moduleName . fst))
+        >>> map
+          (\((h, PackageName packageName) :| t) ->
+            ASingleLineComment (SingleLineComment ("-- " <> packageName))
+            : AImport h
+            : map (AImport . fst) t
+          )
+        >>> List.intersperse [ABlankLine (BlankLine "")]
+        >>> List.concat
 
 findEnclosingFile
   :: ( MonadIO m
      )
-  => (FilePath -> Bool) -> FilePath -> m (Maybe FilePath)
-findEnclosingFile fileMatcher =  liftIO . canonicalizePath >=> runMaybeT . go
+  => (FilePath -> Bool) -> FilePath -> m (Maybe AbsoluteFilePath)
+findEnclosingFile fileMatcher =  absoluteFilePath >=> runMaybeT . go
   where
-    go filePath = do
+    go (AbsoluteFilePath filePath) = do
       liftIO (doesPathExist filePath) >>= guard
 
       let tryPath = do
@@ -527,13 +574,13 @@ findEnclosingFile fileMatcher =  liftIO . canonicalizePath >=> runMaybeT . go
             liftIO (listDirectory filePath)
               <&> List.filter fileMatcher
               <&> listToMaybe
-              <&> fmap (filePath</>)
+              <&> fmap (AbsoluteFilePath . (filePath</>))
               >>= maybe mzero pure
 
           ascendToParent = do
             let parentDir = takeDirectory filePath
             guard (parentDir /= filePath)
-            go parentDir
+            go (AbsoluteFilePath parentDir)
 
       tryPath <|> ascendToParent
 
@@ -545,56 +592,65 @@ newtype ModuleName = ModuleName {unModuleName :: Text} deriving (Show, Eq, Ord)
 projectModules
   :: ( MonadUnliftIO m
      )
-  => FilePath -> m [(PackageName, [ModuleName])]
+  => FilePath -> m (MonoidalMap ModuleName (NonEmpty PackageSource))
 projectModules filePath = do
   mcabalProjectFile <-
     findEnclosingFile (("cabal.project"==) . takeFileName) filePath
 
   case mcabalProjectFile of
-    Just cabalProjectFile -> do
+    Just (AbsoluteFilePath cabalProjectFile) -> do
       cabalFiles <-
         gatherFiles ".cabal" (takeDirectory cabalProjectFile)
 
-      traverse localModules cabalFiles <&> catMaybes
+      traverse (localModules . unAbsoluteFilePath) cabalFiles <&> mconcat
 
     Nothing ->
-      pure []
+      pure MonoidalMap.empty
 
 
 localModules
   :: ( MonadUnliftIO m
      )
-  => FilePath -> m (Maybe (PackageName, [ModuleName]))
+  => FilePath -> m (MonoidalMap ModuleName (NonEmpty PackageSource))
 localModules filePath = do
-  mcabalFile <-
+  mpathToCabalFile <-
     findEnclosingFile (byExtension ".cabal") filePath
 
-  case mcabalFile of
-    Just cabalFile -> do
-      modules <-
-        gatherFiles ".hs" (takeDirectory cabalFile)
-        >>= liftIO . mapConcurrently (fmap (either (const Nothing) Just . parse parseModuleAndModuleName "") . Text.readFile)
-        <&> catMaybes
+  case mpathToCabalFile of
+    Just (AbsoluteFilePath cabalPath) ->
+      gatherFiles ".hs" (takeDirectory cabalPath)
+        >>= liftIO . mapConcurrently (fmap (either (const Nothing) Just . parse parseModuleAndModuleName "") . Text.readFile . unAbsoluteFilePath)
+        <&> mapMaybe
+              (fmap $ \moduleName ->
+                  MonoidalMap.singleton
+                    moduleName
+                    ( NonEmpty.fromList
+                        [ ALocalPackage
+                            LocalPackage
+                              { packageName =
+                                  PackageName
+                                    . Text.pack
+                                    . takeBaseName
+                                    $ filePath
+                              , pathToCabalFile = AbsoluteFilePath filePath
+                              }
+                        ]
+                    )
+              )
+        <&> mconcat
 
-      pure $ Just
-        ( PackageName
-            . Text.pack
-            . takeBaseName
-            $ cabalFile
-        , modules
-        )
 
     Nothing ->
-      pure Nothing
+      pure MonoidalMap.empty
 
 gatherFiles
   :: ( MonadUnliftIO m
      )
-  => String -> FilePath -> m [FilePath]
+  => String -> FilePath -> m [AbsoluteFilePath]
 gatherFiles extension =
-  liftIO . canonicalizePath >=> fmap DList.toList  . go
+  absoluteFilePath >=> fmap DList.toList  . go
   where
-    go filePath = do
+    go (AbsoluteFilePath filePath) = do
       runInIO <- askRunInIO
       fmap (fromMaybe DList.empty)
         . runMaybeT
@@ -609,7 +665,7 @@ gatherFiles extension =
           let descendDirectory = do
                 liftIO (doesDirectoryExist filePath) >>= guard
                 liftIO (listDirectory filePath)
-                  <&> map (filePath </>)
+                  <&> map (AbsoluteFilePath . (filePath </>))
                   >>= liftIO . mapConcurrently  (runInIO . go)
                   <&> mconcat
 
@@ -617,7 +673,7 @@ gatherFiles extension =
                 filePath
                   & byExtension extension
                   & guard
-                pure (DList.singleton filePath)
+                pure (DList.singleton (AbsoluteFilePath filePath))
 
           descendDirectory <|> checkFile
 
@@ -633,11 +689,16 @@ parseModuleAndModuleName = moduleName <|> (parseRestOfLine >> parseModuleAndModu
 getModuleMapFromGhc
   :: ( MonadUnliftIO m
      )
-  => m (Map ModuleName PackageName)
+  => m (MonoidalMap ModuleName (NonEmpty PackageSource))
 getModuleMapFromGhc =
   liftIO getPackagesFromGhc
-    >>= liftIO . mapConcurrently (\packageName -> map (, packageName) <$> getPackageModulesFromGhc packageName)
-    <&> Map.fromList . concat
+    >>= liftIO
+          . mapConcurrently
+              ( \packageName ->
+                  map (, NonEmpty.fromList [AGlobalPackage packageName])
+                    <$> getPackageModulesFromGhc packageName
+              )
+    <&> MonoidalMap.fromListWith (<>) . concat
 
 
 getPackagesFromGhc :: IO [PackageName]
@@ -669,3 +730,8 @@ getPackageModulesFromGhc (PackageName packageName)=
 parseRestOfLine :: Parser Text
 parseRestOfLine =
       (<?> "restOfLine") $ Text.pack <$> manyTill (printChar <|> char '\t') (void eol)
+
+newtype AbsoluteFilePath = AbsoluteFilePath {unAbsoluteFilePath :: FilePath} deriving (Show, Eq, Ord)
+
+absoluteFilePath :: (MonadIO m) => FilePath -> m AbsoluteFilePath
+absoluteFilePath = fmap AbsoluteFilePath . liftIO . makeAbsolute
