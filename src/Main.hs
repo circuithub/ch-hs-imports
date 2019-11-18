@@ -6,6 +6,10 @@
 {-# language TupleSections #-}
 {-# language ApplicativeDo #-}
 {-# language DuplicateRecordFields #-}
+{-# language TypeFamilies #-}
+
+-- async
+import Control.Concurrent.Async (mapConcurrently, forConcurrently_)
 
 -- base
 import Control.Applicative hiding (some, many)
@@ -19,21 +23,13 @@ import Data.Foldable
 import Data.Function
 import Data.Functor
 import qualified Data.List as List
+import Data.List.NonEmpty (NonEmpty, NonEmpty((:|)))
+import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe
 import Data.Tuple (swap)
 import Data.Void
 import Prelude hiding (takeWhile)
 import System.IO (stderr, hPutStrLn)
-
-import Control.Concurrent.Async (mapConcurrently, forConcurrently_)
-import Control.Monad.IO.Unlift
-
-import Data.Map.Monoidal (MonoidalMap)
-import qualified Data.Map.Monoidal as MonoidalMap
-import Data.List.NonEmpty (NonEmpty, NonEmpty((:|)))
-import qualified Data.List.NonEmpty as NonEmpty
-
-
 
 -- directory
 import System.Directory
@@ -47,6 +43,14 @@ import System.FilePath.Posix
 -- megaparsec
 import Text.Megaparsec
 import Text.Megaparsec.Char
+
+-- monoidal-containers
+import Data.Map.Monoidal (MonoidalMap)
+import qualified Data.Map.Monoidal as MonoidalMap
+
+-- nonempty-containers
+import qualified Data.Set.NonEmpty as NESet
+import Data.Set.NonEmpty (NESet)
 
 -- optparse-applicative
 import qualified Options.Applicative as Options
@@ -73,6 +77,8 @@ import qualified Data.Text.Lazy.Builder as TextBuilder
 -- transformers
 import Control.Monad.Trans.Maybe
 
+-- unliftio-core
+import Control.Monad.IO.Unlift
 
 data Options = Options
   { overwrite :: Bool
@@ -155,14 +161,14 @@ groupFileImports
     reportProgress
     (liftIO $ putStrLn  $ "processing " ++ show (length filePaths) ++ " number of files.")
 
-  globalModulesFromAllGhcPackages <-
+  (globalModulesFromAllGhcPackages, determineModulePackage_) <-
     if modulesFromAllGhcPkgs
       then
-        getModuleMapFromGhc
+        (, \ a b c -> pure $ determineModulePackage' a b c ) <$> getModuleMapFromGhc
         <* when
             reportProgress
             (liftIO $ putStrLn "got all exposed modules from GHC package set")
-      else pure MonoidalMap.empty
+      else pure (MonoidalMap.empty, determineModulePackage)
 
   localModulesCWD <-
     if localModulesFromCurrentDir
@@ -208,7 +214,7 @@ groupFileImports
 
       Right ExtractImports{beforeImports, imports, afterImports} ->
         do groupedImports <-
-              liftIO $ groupImportsByPackage <$> traverse (determineModulePackage absoluteFilePath_ moduleMap) imports
+              liftIO $ groupImportsByPackage <$> traverse (determineModulePackage_ absoluteFilePath_ moduleMap) imports
 
            [beforeImports, groupedImports, afterImports] & mconcat & contentToText & outPutResult & liftIO
 
@@ -463,6 +469,7 @@ bol = (<?> "bol") $ do
 data LocalPackage = LocalPackage
   { packageName :: PackageName
   , pathToCabalFile :: AbsoluteFilePath
+  , cabalPackageDependencies :: [PackageName]
   } deriving (Show, Eq, Ord)
 
 data PackageSource
@@ -488,61 +495,99 @@ dropPackageVersion t =
 
   in t & Text.splitAt idx & fst
 
-determineModulePackage :: AbsoluteFilePath -> MonoidalMap ModuleName (NonEmpty PackageSource) -> Import -> IO (Import, PackageName)
-determineModulePackage _ _ i@Import{packageName = Just packageName } = pure (i, PackageName packageName)
-determineModulePackage absoluteFilePath_ localModules_ i@Import{moduleName}
+determineModulePackage'
+  :: AbsoluteFilePath
+  -> MonoidalMap ModuleName (NESet PackageSource)
+  -> Import
+  -> (Import, PackageName)
+determineModulePackage' absoluteFilePath_ localModules_ i@Import{moduleName}
+  | Import{packageName = Just packageName } <- i
+      = (i, PackageName packageName)
+
   | Just inPackageMap
       <- MonoidalMap.lookup moduleName localModules_
-      = pure (i, pickPackage absoluteFilePath_ inPackageMap)
+      =  (i, pickPackage absoluteFilePath_ inPackageMap)
 
-  | otherwise =
-      maybe (i, PackageName "") (i,)
-      . listToMaybe
-      . S.fst'
-      <$> withStreamingCommand
-            ("ghc-pkg find-module " <> Text.unpack (unModuleName moduleName) <> " --simple-output")
-            SB.empty
-            ( SB.words
-                >>> S.mapped (SB.foldlChunks (<>) "")
-                >>> S.map (PackageName . dropPackageVersion . Text.decodeUtf8)
-                >>> S.hoist SB.effects
-                >>> S.toList
-            )
+  | otherwise = (i, PackageName "")
 
-pickPackage :: AbsoluteFilePath -> NonEmpty PackageSource -> PackageName
-pickPackage (AbsoluteFilePath filePath)= \case
+determineModulePackage
+  :: AbsoluteFilePath
+  -> MonoidalMap ModuleName (NESet PackageSource)
+  -> Import
+  -> IO (Import, PackageName)
+determineModulePackage absoluteFilePath_ localModules_ import_@Import{moduleName} =  do
+  fromFindModule <-
+   withStreamingCommand
+     ("ghc-pkg find-module " <> Text.unpack (unModuleName moduleName) <> " --simple-output")
+     SB.empty
+     ( SB.words
+         >>> S.mapped (SB.foldlChunks (<>) "")
+         >>> S.map
+              ((moduleName,)
+                . NESet.singleton
+                . AGlobalPackage
+                . PackageName
+                . dropPackageVersion
+                . Text.decodeUtf8
+              )
+         >>> S.hoist SB.effects
+         >>> S.toList
+     )
+     <&> MonoidalMap.fromList . S.fst'
+
+  pure $ determineModulePackage' absoluteFilePath_ (localModules_ <> fromFindModule) import_
+
+pickPackage :: AbsoluteFilePath -> NESet PackageSource -> PackageName
+pickPackage (AbsoluteFilePath filePath)= NESet.toList >>> \case
   (matchOnePackage :| []) ->
     packageNameFromSource matchOnePackage
 
-  -- for now when there are multiple matches don't do anything fancy
-  --  * if the file path matches a single local package pick that
-  --  * otherwise be deterministic by picking first one after sorting the matches
+  -- when there are multiple matches
+  --  * first attempt to filter the matching packages according to the cabal file dependencies
+  --  * otherwise if the file path matches a single local package pick that
+  --  * otherwise be deterministic by picking first one sorted set passed in
   manyMatches ->
-    let oneBestLocalMatch =
+    let closestParentCabalFile =
           manyMatches
-            & NonEmpty.filter
+            & NonEmpty.toList
+            & mapMaybe
                 (\case
                     AGlobalPackage _ ->
-                      False
+                      Nothing
 
                     ALocalPackage
-                      LocalPackage
-                        {pathToCabalFile = AbsoluteFilePath pathToCabalFile } ->
-                      List.isPrefixOf (takeDirectory pathToCabalFile) filePath
+                      localPackage@LocalPackage
+                        {pathToCabalFile = AbsoluteFilePath pathToCabalFile } -> do
+
+                      guard
+                        (takeDirectory pathToCabalFile `List.isPrefixOf` filePath)
+
+                      pure localPackage
+                )
+
+        oneBestLocalMatch =
+          closestParentCabalFile
+            & \case
+                [LocalPackage {packageName}] -> Just packageName
+                _ -> Nothing
+
+        cabalDependencyMatch = do
+          LocalPackage {cabalPackageDependencies} <- closestParentCabalFile & listToMaybe
+          manyMatches
+            & NonEmpty.filter
+                ( (`elem` cabalPackageDependencies)
+                    . packageNameFromSource
                 )
             & \case
                 [x] -> Just (packageNameFromSource x)
                 _ -> Nothing
 
-
-
         fallBackMatch =
           manyMatches
-            & NonEmpty.sort
             & NonEmpty.head
             & packageNameFromSource
 
-    in fromMaybe fallBackMatch  oneBestLocalMatch
+    in fromMaybe fallBackMatch  (cabalDependencyMatch <|> oneBestLocalMatch)
 
 groupImportsByPackage :: [(Import, PackageName)] -> [Content]
 groupImportsByPackage = maybe [] go . NonEmpty.nonEmpty
@@ -592,7 +637,7 @@ newtype ModuleName = ModuleName {unModuleName :: Text} deriving (Show, Eq, Ord)
 projectModules
   :: ( MonadUnliftIO m
      )
-  => FilePath -> m (MonoidalMap ModuleName (NonEmpty PackageSource))
+  => FilePath -> m (MonoidalMap ModuleName (NESet PackageSource))
 projectModules filePath = do
   mcabalProjectFile <-
     findEnclosingFile (("cabal.project"==) . takeFileName) filePath
@@ -611,30 +656,50 @@ projectModules filePath = do
 localModules
   :: ( MonadUnliftIO m
      )
-  => FilePath -> m (MonoidalMap ModuleName (NonEmpty PackageSource))
+  => FilePath -> m (MonoidalMap ModuleName (NESet PackageSource))
 localModules filePath = do
   mpathToCabalFile <-
     findEnclosingFile (byExtension ".cabal") filePath
 
   case mpathToCabalFile of
-    Just (AbsoluteFilePath cabalPath) ->
+    Just (AbsoluteFilePath cabalPath) -> do
+
+      cabalPackageDependencies <-
+        Text.readFile cabalPath
+          <&> parse parseCabalDependencies  cabalPath
+          >>= \case
+                Left e ->
+                  hPutStrLn
+                        stderr
+                        ( unlines
+                            [ "Failed parsing dependencies from cabal file :"
+                            , errorBundlePretty e
+                            , "for file: "  ++ cabalPath
+                            ]
+                        )
+                  $> []
+
+                Right x -> pure x
+          & liftIO
+
       gatherFiles ".hs" (takeDirectory cabalPath)
         >>= liftIO . mapConcurrently (fmap (either (const Nothing) Just . parse parseModuleAndModuleName "") . Text.readFile . unAbsoluteFilePath)
         <&> mapMaybe
               (fmap $ \moduleName ->
                   MonoidalMap.singleton
                     moduleName
-                    ( NonEmpty.fromList
-                        [ ALocalPackage
+                    ( NESet.singleton
+                        ( ALocalPackage
                             LocalPackage
                               { packageName =
                                   PackageName
                                     . Text.pack
                                     . takeBaseName
-                                    $ filePath
-                              , pathToCabalFile = AbsoluteFilePath filePath
+                                    $ cabalPath
+                              , pathToCabalFile = AbsoluteFilePath cabalPath
+                              , ..
                               }
-                        ]
+                        )
                     )
               )
         <&> mconcat
@@ -689,13 +754,13 @@ parseModuleAndModuleName = moduleName <|> (parseRestOfLine >> parseModuleAndModu
 getModuleMapFromGhc
   :: ( MonadUnliftIO m
      )
-  => m (MonoidalMap ModuleName (NonEmpty PackageSource))
+  => m (MonoidalMap ModuleName (NESet PackageSource))
 getModuleMapFromGhc =
   liftIO getPackagesFromGhc
     >>= liftIO
           . mapConcurrently
               ( \packageName ->
-                  map (, NonEmpty.fromList [AGlobalPackage packageName])
+                  map (, NESet.singleton (AGlobalPackage packageName))
                     <$> getPackageModulesFromGhc packageName
               )
     <&> MonoidalMap.fromListWith (<>) . concat
@@ -735,3 +800,50 @@ newtype AbsoluteFilePath = AbsoluteFilePath {unAbsoluteFilePath :: FilePath} der
 
 absoluteFilePath :: (MonadIO m) => FilePath -> m AbsoluteFilePath
 absoluteFilePath = fmap AbsoluteFilePath . liftIO . makeAbsolute
+
+
+parseCabalDependencies :: Parser [PackageName]
+parseCabalDependencies = do
+  colStartPos <-
+    skipManyTill
+      (try otherLine)
+      (try parseBuildDependsStart)
+
+  some (parsePackageName colStartPos)
+
+  where
+    otherLine =
+      manyTill printChar (void eol <|> eof)
+
+    parseBuildDependsStart =
+      space1
+        >> (mkPos . (+1) . unPos . sourceColumn <$> getSourcePos)
+        <* (string "build-depends" >> space >> void (char ':') >> space)
+        <?> "parseBuildDependsStart"
+
+    parsePackageName :: Pos -> Parser PackageName
+    parsePackageName leftBorder = do
+      try (space >> char ',' >> space)
+        <|> pure ()
+
+      pos <- sourceColumn <$> getSourcePos <?> "start column"
+
+      guard (leftBorder <= pos)
+        <?> "check start column"
+
+      PackageName . Text.pack
+        <$> ( (:)
+                <$> letterChar
+                <*> many
+                      ( choice
+                          [ alphaNumChar
+                          , char '-'
+                          , char '_'
+                          ]
+                      )
+                <* skipManyTill
+                     anySingle
+                     ( try (void eol)
+                         <|> (char ',' >> space)
+                     )
+            ) <?> "package name"

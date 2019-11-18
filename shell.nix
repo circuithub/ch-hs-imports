@@ -19,6 +19,7 @@ let
         megaparsec
         directory
         async
+        nonempty-containers
       ]
     );
   # the dependencies available in the shell
