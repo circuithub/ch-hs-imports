@@ -1,21 +1,22 @@
 { mkDerivation
-, async
+, abstract-par
 , base
 , containers
+, deepseq
 , directory
 , dlist
 , filepath
 , megaparsec
+, monad-par
+, monad-par-extras
 , monoidal-containers
+, mtl
 , nonempty-containers
 , optparse-applicative
+, process
 , stdenv
-, streaming
-, streaming-bytestring
-, streaming-process
 , text
 , transformers
-, unliftio-core
 }:
 mkDerivation {
   pname = "ch-hs-imports";
@@ -24,22 +25,23 @@ mkDerivation {
   isLibrary = false;
   isExecutable = true;
   executableHaskellDepends = [
-    async
+    abstract-par
     base
     containers
+    deepseq
     directory
     dlist
     filepath
     megaparsec
+    monad-par
+    monad-par-extras
     monoidal-containers
+    mtl
     nonempty-containers
     optparse-applicative
-    streaming
-    streaming-bytestring
-    streaming-process
+    process
     text
     transformers
-    unliftio-core
   ];
   license = stdenv.lib.licenses.mit;
 }

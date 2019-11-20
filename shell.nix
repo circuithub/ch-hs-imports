@@ -20,6 +20,8 @@ let
         directory
         async
         nonempty-containers
+        monad-par
+        monad-par-extras
       ]
     );
   # the dependencies available in the shell

@@ -7,16 +7,17 @@
 {-# language ApplicativeDo #-}
 {-# language DuplicateRecordFields #-}
 {-# language TypeFamilies #-}
+{-# language DeriveGeneric #-}
+{-# language DeriveAnyClass #-}
 
--- async
-import Control.Concurrent.Async (mapConcurrently, forConcurrently_)
+-- abstract-par
+import Control.Monad.Par.Class (ParFuture)
 
 -- base
 import Control.Applicative hiding (some, many)
 import qualified Control.Applicative as Applicative
 import Control.Arrow ((>>>))
 import Control.Monad
-import Control.Monad.IO.Class
 import Data.Bifunctor (first, second, bimap)
 import qualified Data.Char as Char
 import Data.Foldable
@@ -28,10 +29,16 @@ import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe
 import Data.Tuple (swap)
 import Data.Void
+import GHC.Generics (Generic)
 import Prelude hiding (takeWhile)
 import System.IO (stderr, hPutStrLn)
+
+-- containers
 import Data.Set (Set)
 import qualified Data.Set as Set
+
+-- deepseq
+import Control.DeepSeq
 
 -- directory
 import System.Directory
@@ -46,9 +53,18 @@ import System.FilePath.Posix
 import Text.Megaparsec
 import Text.Megaparsec.Char
 
+-- monad-par
+import Control.Monad.Par.IO (runParIO)
+
+-- monad-par-extras
+import Control.Monad.Par.Combinator (parMapM)
+
 -- monoidal-containers
 import Data.Map.Monoidal (MonoidalMap)
 import qualified Data.Map.Monoidal as MonoidalMap
+
+-- mtl
+import Control.Monad.Trans
 
 -- nonempty-containers
 import qualified Data.Set.NonEmpty as NESet
@@ -57,21 +73,12 @@ import Data.Set.NonEmpty (NESet)
 -- optparse-applicative
 import qualified Options.Applicative as Options
 
--- streaming
-import qualified Streaming as S
-import qualified Streaming.Prelude as S
-
--- streaming-bytestring
-import qualified Data.ByteString.Streaming as SB
-import qualified Data.ByteString.Streaming.Char8 as SB
-
--- streaming-process
-import Streaming.Process (withStreamingCommand)
+-- process
+import System.Process (runInteractiveCommand)
 
 -- text
 import qualified Data.Text as Text
 import Data.Text (Text)
-import qualified Data.Text.Encoding as Text
 import qualified Data.Text.IO as Text
 import qualified Data.Text.Lazy as Text (toStrict)
 import qualified Data.Text.Lazy.Builder as TextBuilder
@@ -79,13 +86,10 @@ import qualified Data.Text.Lazy.Builder as TextBuilder
 -- transformers
 import Control.Monad.Trans.Maybe
 
--- unliftio-core
-import Control.Monad.IO.Unlift
 
 data Options = Options
   { overwrite :: Bool
   , localModulesFromCurrentDir :: Bool
-  , modulesFromAllGhcPkgs :: Bool
   , reportProgress :: Bool
   , filePaths :: [String]
   }
@@ -105,14 +109,6 @@ options = do
     ]
     & mconcat
     & Options.switch
-
-  modulesFromAllGhcPkgs <-
-    [ Options.long "modules-from-all-ghc-pkgs"
-    , Options.help "Get the module set once at the start from all the packages registered with ghc. A lot faster."
-    ]
-    & mconcat
-    & Options.switch
-
 
   reportProgress <-
     [ Options.long "report-progress"
@@ -143,18 +139,18 @@ main = do
             & Options.info (options <**> Options.helper)
           )
 
-  groupFileImports porgramOptions
+  runParIO (groupFileImports porgramOptions)
 
 
 groupFileImports
-  :: ( MonadUnliftIO m
+  :: ( MonadIO m
+     , ParFuture iv m
      )
   => Options -> m ()
 groupFileImports
   Options
     { overwrite
     , localModulesFromCurrentDir
-    , modulesFromAllGhcPkgs
     , reportProgress
     , filePaths
     } = do
@@ -163,14 +159,11 @@ groupFileImports
     reportProgress
     (liftIO $ putStrLn  $ "processing " ++ show (length filePaths) ++ " number of files.")
 
-  (globalModulesFromAllGhcPackages, determineModulePackage_) <-
-    if modulesFromAllGhcPkgs
-      then
-        (, \ a b c d -> pure $ determineModulePackage' a b c d) <$> getModuleMapFromGhc
-        <* when
-            reportProgress
-            (liftIO $ putStrLn "got all exposed modules from GHC package set")
-      else pure (MonoidalMap.empty, determineModulePackage)
+  globalModulesFromAllGhcPackages <-
+    liftIO getPackageModulesFromGhcDump
+      <* when
+          reportProgress
+          (liftIO $ putStrLn "got all exposed modules from GHC package set")
 
   localModulesCWD <-
     if localModulesFromCurrentDir
@@ -182,47 +175,56 @@ groupFileImports
       else
         pure (Set.empty, MonoidalMap.empty)
 
-  runInIO <- askRunInIO
-  liftIO $ forConcurrently_  filePaths $ \filePath -> runInIO $ do
-    absoluteFilePath_ <- absoluteFilePath filePath
-    fileText <- liftIO $ Text.readFile filePath
-    (localPackages_, moduleMap) <-
-      ( if localModulesFromCurrentDir
-         then
-           pure localModulesCWD
+  void
+    $ filePaths
+    & parMapM
+    (\filePath -> do
+        absoluteFilePath_ <- absoluteFilePath filePath
+        fileText <- liftIO $ Text.readFile filePath
+        (localPackages_, moduleMap) <-
+          ( if localModulesFromCurrentDir
+             then
+               pure localModulesCWD
 
-         else
-           ( (<>)
-               <$> localModules filePath
-               <*> projectModules filePath
-           )
-          <* when
-              reportProgress
-              (liftIO $ putStrLn $ "got local modules relative to file path: " ++ filePath)
+             else
+               ( (<>)
+                   <$> localModules filePath
+                   <*> projectModules filePath
+               )
+              <* when
+                  reportProgress
+                  (liftIO $ putStrLn $ "got local modules relative to file path: " ++ filePath)
 
-      ) <&> second (<> globalModulesFromAllGhcPackages)
+          ) <&> second (<> globalModulesFromAllGhcPackages)
 
-    let outPutResult =
-          if overwrite
-            then \newFileText ->
-                    when
-                      (newFileText /= fileText)
-                      (Text.writeFile filePath newFileText)
-            else Text.putStr
+        let outPutResult =
+              if overwrite
+                then \newFileText ->
+                        when
+                          (newFileText /= fileText)
+                          (Text.writeFile filePath newFileText)
+                else Text.putStr
 
-    case second (extractImports . contentSplitTrailingBlankLines) $ parse parseConent filePath fileText of
-      Left e ->
-        liftIO $ hPutStrLn stderr (unlines ["Failed parsing:", errorBundlePretty e, "for file: "  ++ filePath])
+        case second (extractImports . contentSplitTrailingBlankLines) $ parse parseConent filePath fileText of
+          Left e ->
+            liftIO $ hPutStrLn stderr (unlines ["Failed parsing:", errorBundlePretty e, "for file: "  ++ filePath])
 
-      Right ExtractImports{beforeImports, imports, afterImports} ->
-        do groupedImports <-
-              liftIO $ groupImportsByPackage <$> traverse (determineModulePackage_ absoluteFilePath_ localPackages_ moduleMap) imports
+          Right ExtractImports{beforeImports, imports, afterImports} ->
+             let groupedImports =
+                    imports
+                      & map (determineModulePackage absoluteFilePath_ localPackages_ moduleMap)
+                      & groupImportsByPackage
 
-           [beforeImports, groupedImports, afterImports] & mconcat & contentToText & outPutResult & liftIO
+             in [beforeImports, groupedImports, afterImports]
+                  & mconcat
+                  & contentToText
+                  & outPutResult
+                  & liftIO
 
-    when
-      reportProgress
-      (liftIO $ putStrLn $ "finished: " ++ filePath)
+        when
+          reportProgress
+          (liftIO $ putStrLn $ "finished: " ++ filePath)
+    )
 
 
 contentSplitTrailingBlankLines :: [Content] -> [Content]
@@ -257,10 +259,10 @@ splitTrailingBlankLines =
     >>> swap
 
 data ExtractImports = ExtractImports
-  { beforeImports :: [Content]
-  , imports :: [Import]
-  , afterImports :: [Content]
-  } deriving (Show, Eq, Ord)
+  { beforeImports :: ![Content]
+  , imports :: ![Import]
+  , afterImports :: ![Content]
+  } deriving (Show, Eq, Ord, Generic, NFData)
 
 extractImports :: [Content] -> ExtractImports
 extractImports xs0 =
@@ -313,24 +315,24 @@ contentToText =
       AOtherLine (OtherLine t) -> t
 
 data Import = Import
-  { content :: Text
-  , packageName :: Maybe Text
-  , moduleName :: ModuleName
+  { content :: !Text
+  , packageName :: !(Maybe Text)
+  , moduleName :: !ModuleName
   }
-  deriving (Show, Eq, Ord)
+  deriving (Show, Eq, Ord, Generic, NFData)
 
-newtype SingleLineComment = SingleLineComment Text deriving (Show, Eq, Ord)
+newtype SingleLineComment = SingleLineComment Text deriving (Show, Eq, Ord, Generic, NFData)
 
-newtype BlankLine = BlankLine Text deriving (Show, Eq, Ord)
+newtype BlankLine = BlankLine Text deriving (Show, Eq, Ord, Generic, NFData)
 
-newtype OtherLine = OtherLine Text deriving (Show, Eq, Ord)
+newtype OtherLine = OtherLine Text deriving (Show, Eq, Ord, Generic, NFData)
 
 data Content
-  = ASingleLineComment SingleLineComment
-  | ABlankLine BlankLine
-  | AImport Import
-  | AOtherLine OtherLine
-  deriving (Show, Eq, Ord)
+  = ASingleLineComment !SingleLineComment
+  | ABlankLine !BlankLine
+  | AImport !Import
+  | AOtherLine !OtherLine
+  deriving (Show, Eq, Ord, Generic, NFData)
 
 type Parser = Parsec Void Text
 
@@ -469,41 +471,30 @@ bol = (<?> "bol") $ do
   guard (pos == pos1)
 
 data LocalPackage = LocalPackage
-  { packageName :: PackageName
-  , pathToCabalFile :: AbsoluteFilePath
-  , cabalPackageDependencies :: [PackageName]
-  } deriving (Show, Eq, Ord)
+  { packageName :: !PackageName
+  , pathToCabalFile :: !AbsoluteFilePath
+  , cabalPackageDependencies :: ![PackageName]
+  } deriving (Show, Eq, Ord, Generic, NFData)
 
 data PackageSource
-  = ALocalPackage LocalPackage
-  | AGlobalPackage PackageName
-  deriving (Show, Eq, Ord)
+  = ALocalPackage !LocalPackage
+  | AGlobalPackage !PackageName
+  deriving (Show, Eq, Ord, Generic, NFData)
 
-newtype PackageName = PackageName {getPackageName :: Text} deriving (Eq, Ord, Show)
+newtype PackageName = PackageName {getPackageName :: Text} deriving (Eq, Ord, Show, Generic, NFData)
 
 packageNameFromSource :: PackageSource -> PackageName
 packageNameFromSource = \case
   AGlobalPackage packageName ->  packageName
   ALocalPackage LocalPackage{packageName} ->  packageName
 
-dropPackageVersion :: Text -> Text
-dropPackageVersion t =
-  let idx =
-        t
-          & Text.reverse
-          & Text.findIndex ('-' ==)
-          & fromMaybe 1
-          & (\i -> Text.length t - i - 1)
-
-  in t & Text.splitAt idx & fst
-
-determineModulePackage'
+determineModulePackage
   :: AbsoluteFilePath
   -> Set LocalPackage
   -> MonoidalMap ModuleName (NESet PackageSource)
   -> Import
   -> (Import, PackageName)
-determineModulePackage' absoluteFilePath_ localPackages_ localModules_ i@Import{moduleName}
+determineModulePackage absoluteFilePath_ localPackages_ localModules_ i@Import{moduleName}
   | Import{packageName = Just packageName } <- i
       = (i, PackageName packageName)
 
@@ -512,34 +503,6 @@ determineModulePackage' absoluteFilePath_ localPackages_ localModules_ i@Import{
       =  (i, pickPackage absoluteFilePath_ localPackages_ inPackageMap)
 
   | otherwise = (i, PackageName "")
-
-determineModulePackage
-  :: AbsoluteFilePath
-  -> Set LocalPackage
-  -> MonoidalMap ModuleName (NESet PackageSource)
-  -> Import
-  -> IO (Import, PackageName)
-determineModulePackage absoluteFilePath_ localPackages_ localModules_ import_@Import{moduleName} =  do
-  fromFindModule <-
-   withStreamingCommand
-     ("ghc-pkg find-module " <> Text.unpack (unModuleName moduleName) <> " --simple-output")
-     SB.empty
-     ( SB.words
-         >>> S.mapped (SB.foldlChunks (<>) "")
-         >>> S.map
-              ((moduleName,)
-                . NESet.singleton
-                . AGlobalPackage
-                . PackageName
-                . dropPackageVersion
-                . Text.decodeUtf8
-              )
-         >>> S.hoist SB.effects
-         >>> S.toList
-     )
-     <&> MonoidalMap.fromListWith (<>) . S.fst'
-
-  pure $ determineModulePackage' absoluteFilePath_ localPackages_ (localModules_ <> fromFindModule) import_
 
 pickPackage :: AbsoluteFilePath -> Set LocalPackage -> NESet PackageSource -> PackageName
 pickPackage (AbsoluteFilePath filePath) localPackages_ = NESet.toList >>> \case
@@ -639,10 +602,11 @@ findEnclosingFile fileMatcher =  absoluteFilePath >=> runMaybeT . go
 byExtension :: String -> FilePath -> Bool
 byExtension extension = and . sequence [isExtensionOf extension, not . List.null . takeBaseName]
 
-newtype ModuleName = ModuleName {unModuleName :: Text} deriving (Show, Eq, Ord)
+newtype ModuleName = ModuleName {unModuleName :: Text} deriving (Show, Eq, Ord, Generic, NFData)
 
 projectModules
-  :: ( MonadUnliftIO m
+  :: ( MonadIO m
+     , ParFuture iv m
      )
   => FilePath -> m (Set LocalPackage, MonoidalMap ModuleName (NESet PackageSource))
 projectModules filePath = do
@@ -661,7 +625,8 @@ projectModules filePath = do
 
 
 localModules
-  :: ( MonadUnliftIO m
+  :: ( MonadIO m
+     , ParFuture iv m
      )
   => FilePath -> m (Set LocalPackage, MonoidalMap ModuleName (NESet PackageSource))
 localModules filePath = do
@@ -690,7 +655,7 @@ localModules filePath = do
           & liftIO
 
       gatherFiles ".hs" (takeDirectory cabalPath)
-        >>= liftIO . mapConcurrently (fmap (either (const Nothing) Just . parse parseModuleAndModuleName "") . Text.readFile . unAbsoluteFilePath)
+        >>= parMapM (fmap (either (const Nothing) Just . parse parseModuleAndModuleName "") . (liftIO . Text.readFile) . unAbsoluteFilePath)
         <&> mapMaybe
               (fmap $ \moduleName ->
                 let localPackage =
@@ -719,14 +684,14 @@ localModules filePath = do
       pure (Set.empty, MonoidalMap.empty)
 
 gatherFiles
-  :: ( MonadUnliftIO m
+  :: ( MonadIO m
+     , ParFuture iv m
      )
   => String -> FilePath -> m [AbsoluteFilePath]
 gatherFiles extension =
   absoluteFilePath >=> fmap DList.toList  . go
   where
-    go (AbsoluteFilePath filePath) = do
-      runInIO <- askRunInIO
+    go (AbsoluteFilePath filePath) =
       fmap (fromMaybe DList.empty)
         . runMaybeT
         $ do
@@ -741,7 +706,7 @@ gatherFiles extension =
                 liftIO (doesDirectoryExist filePath) >>= guard
                 liftIO (listDirectory filePath)
                   <&> map (AbsoluteFilePath . (filePath </>))
-                  >>= liftIO . mapConcurrently  (runInIO . go)
+                  >>= lift . parMapM  go
                   <&> mconcat
 
               checkFile = do
@@ -760,53 +725,11 @@ parseModuleAndModuleName = moduleName <|> (parseRestOfLine >> parseModuleAndModu
          >> some spaceChar
          >> parseModuleName
 
-
-getModuleMapFromGhc
-  :: ( MonadUnliftIO m
-     )
-  => m (MonoidalMap ModuleName (NESet PackageSource))
-getModuleMapFromGhc =
-  liftIO getPackagesFromGhc
-    >>= liftIO
-          . mapConcurrently
-              ( \packageName ->
-                  map (, NESet.singleton (AGlobalPackage packageName))
-                    <$> getPackageModulesFromGhc packageName
-              )
-    <&> MonoidalMap.fromListWith (<>) . concat
-
-
-getPackagesFromGhc :: IO [PackageName]
-getPackagesFromGhc =
-  S.fst'
-    <$> withStreamingCommand
-          "ghc-pkg list --simple-output"
-          SB.empty
-          ( SB.words
-              >>> S.mapped (SB.foldlChunks (<>) "")
-              >>> S.map (PackageName . dropPackageVersion . Text.decodeUtf8)
-              >>> S.hoist SB.effects
-              >>> S.toList
-            )
-
-getPackageModulesFromGhc :: PackageName -> IO [ModuleName]
-getPackageModulesFromGhc (PackageName packageName)=
-  S.fst'
-    <$> withStreamingCommand
-          ("ghc-pkg field " <> Text.unpack packageName <> " exposed-modules --simple-output")
-          SB.empty
-          ( SB.words
-              >>> S.mapped (SB.foldlChunks (<>) "")
-              >>> S.map (ModuleName . Text.decodeUtf8)
-              >>> S.hoist SB.effects
-              >>> S.toList
-            )
-
 parseRestOfLine :: Parser Text
 parseRestOfLine =
       (<?> "restOfLine") $ Text.pack <$> manyTill (printChar <|> char '\t') (void eol)
 
-newtype AbsoluteFilePath = AbsoluteFilePath {unAbsoluteFilePath :: FilePath} deriving (Show, Eq, Ord)
+newtype AbsoluteFilePath = AbsoluteFilePath {unAbsoluteFilePath :: FilePath} deriving (Show, Eq, Ord, Generic, NFData)
 
 absoluteFilePath :: (MonadIO m) => FilePath -> m AbsoluteFilePath
 absoluteFilePath = fmap AbsoluteFilePath . liftIO . makeAbsolute
@@ -857,3 +780,74 @@ parseCabalDependencies = do
                          <|> (char ',' >> space)
                      )
             ) <?> "package name"
+
+getPackageModulesFromGhcDump :: IO (MonoidalMap ModuleName (NESet PackageSource))
+getPackageModulesFromGhcDump = do
+  (_, hOut, _, _) <-
+    runInteractiveCommand "ghc-pkg dump"
+  Text.hGetContents hOut
+    <&> parse parsePackageDump ""
+    >>= \case
+          Left e ->
+            putStrLn
+              ("error parsing ghc package dump: " ++ errorBundlePretty e)
+              >> pure MonoidalMap.empty
+
+          Right x ->
+            pure x
+
+parsePackageDump :: Parser (MonoidalMap ModuleName (NESet PackageSource))
+parsePackageDump =
+  some parsePackageDumpPackage <&> mconcat
+
+
+parsePackageDumpPackage :: Parser (MonoidalMap ModuleName (NESet PackageSource))
+parsePackageDumpPackage = do
+  package_ <-
+    NESet.singleton
+      . AGlobalPackage
+      . PackageName
+      . Text.pack
+      <$> parseName
+
+  (moduleNames, skipTillEndOfPackage) <-
+    skipSomeTill
+      (try skipLine)
+      ( asum
+          [ (,True) <$> try parseExposedModules
+          , ([], False) <$ try packageEnd
+          ]
+      )
+
+  when
+    skipTillEndOfPackage
+    (void $ skipManyTill (try skipLine) packageEnd)
+
+  pure
+    ( moduleNames
+        & map (, package_)
+        & MonoidalMap.fromListWith (<>)
+    )
+
+  where
+    skipLine = manyTill (printChar <|> char '\t') eol
+
+    parseName =
+      string "name:" >> skipSome nonEolSpaceChar >> someTill printChar eol
+
+    parseExposedModules =
+      string "exposed-modules:"
+        >> eol
+        >> some
+             ( try
+                $ skipSome nonEolSpaceChar
+                >> sepBy1 parseModuleName nonEolSpaceChar
+                <* eol
+             )
+             <&> concat
+
+    packageEnd = try (string "---" >> (void eol <|> eof)) <|> eof
+
+nonEolSpaceChar :: Parser ()
+nonEolSpaceChar =
+  void $ notFollowedBy eol >> (spaceChar <|> char '\t')
