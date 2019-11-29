@@ -13,6 +13,7 @@ let
               with superPkgs.haskell.lib;
               self: super: {
 
+                monoidal-containers = self.callPackage ./haskell/monoidal-containers.nix {};
                 streaming-process = doJailbreak (self.callPackage ./haskell/streaming-process.nix {});
 
               };
