@@ -5,23 +5,27 @@ let
   ghc = pkgs.haskellPackages.ghcWithHoogle
     (
       hs: with hs; [
-        attoparsec
-        optparse-applicative
-        process
-        streaming-process
-        streaming
-        streaming-utils
-        streaming-bytestring
-        streaming-with
-        monoidal-containers
-        pretty-show
-        rio
-        megaparsec
+        # cabal dependencies
+        abstract-par
+        base
+        containers
+        deepseq
         directory
-        async
-        nonempty-containers
+        dlist
+        filepath
+        megaparsec
         monad-par
         monad-par-extras
+        monoidal-containers
+        mtl
+        nonempty-containers
+        optparse-applicative
+        process
+        text
+        transformers
+        # extra useful dependencies
+        pretty-show
+        #rio
       ]
     );
   # the dependencies available in the shell
