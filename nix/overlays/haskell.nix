@@ -11,14 +11,12 @@ let
             overrides =
               with superPkgs.lib.attrsets;
               with superPkgs.haskell.lib;
-              self: super: {
-
-                monoidal-containers = self.callPackage ./haskell/monoidal-containers.nix {};
-                streaming-process = doJailbreak (self.callPackage ./haskell/streaming-process.nix {});
-
-              };
+              self: super: {};
           }
     ) super.haskell.packages;
   };
 in
-{ inherit haskell; }
+{
+  inherit haskell;
+  #haskellPackages = self.haskell.packages.ghc881;
+}
