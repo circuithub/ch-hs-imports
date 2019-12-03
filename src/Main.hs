@@ -837,7 +837,7 @@ parsePackageDumpPackage = do
 
     parseExposedModules =
       string "exposed-modules:"
-        >> eol
+        >> (void eol <|> pure ())
         >> some
              ( try
                 $ skipSome nonEolSpaceChar
