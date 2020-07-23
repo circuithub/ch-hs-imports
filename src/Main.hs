@@ -31,7 +31,7 @@ import Data.Tuple (swap)
 import Data.Void
 import GHC.Generics (Generic)
 import Prelude hiding (takeWhile)
-import System.IO (stderr, hPutStrLn)
+import System.IO (stderr, hPutStrLn, hSetEncoding, utf8)
 
 -- containers
 import Data.Set (Set)
@@ -91,6 +91,7 @@ data Options = Options
   { overwrite :: Bool
   , localModulesFromCurrentDir :: Bool
   , reportProgress :: Bool
+  , useStack :: Bool
   , filePaths :: [String]
   }
 
@@ -113,6 +114,13 @@ options = do
   reportProgress <-
     [ Options.long "report-progress"
     , Options.help "When doing multiple files report progress along the way"
+    ]
+    & mconcat
+    & Options.switch
+
+  useStack <-
+    [ Options.long "use-stack"
+    , Options.help "Run with support for stack."
     ]
     & mconcat
     & Options.switch
@@ -153,6 +161,7 @@ groupFileImports
     , localModulesFromCurrentDir
     , reportProgress
     , filePaths
+    , useStack
     } = do
 
   when
@@ -160,7 +169,7 @@ groupFileImports
     (liftIO $ putStrLn  $ "processing " ++ show (length filePaths) ++ " number of files.")
 
   globalModulesFromAllGhcPackages <-
-    liftIO getPackageModulesFromGhcDump
+    liftIO (getPackageModulesFromGhcDump useStack)
       <* when
           reportProgress
           (liftIO $ putStrLn "got all exposed modules from GHC package set")
@@ -781,12 +790,14 @@ parseCabalDependencies = do
                      )
             ) <?> "package name"
 
-getPackageModulesFromGhcDump :: IO (MonoidalMap ModuleName (NESet PackageSource))
-getPackageModulesFromGhcDump = do
-  (_, hOut, _, _) <-
-    runInteractiveCommand "ghc-pkg dump"
-  Text.hGetContents hOut
-    <&> parse parsePackageDump ""
+getPackageModulesFromGhcDump :: Bool -> IO (MonoidalMap ModuleName (NESet PackageSource))
+getPackageModulesFromGhcDump useStack' = do
+  (_hIn, hOut, _hErr, _) <-
+    runInteractiveCommand (if useStack'
+                            then "stack exec ghc-pkg dump"
+                            else "ghc-pkg dump")
+  hSetEncoding hOut utf8
+  Text.hGetContents hOut <&> parse parsePackageDump ""
     >>= \case
           Left e ->
             putStrLn
