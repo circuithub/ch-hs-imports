@@ -395,8 +395,7 @@ parseImport = (<?> "parseImport") $ do
     (<?> "maybePackageName") $
     try
       (Just <$> do
-          packageName <- char '"' >> (Text.pack <$> someTill printChar (char '"'))
-          pure (Text.cons '"' packageName `Text.snoc` '"')
+          char '"' >> (Text.pack <$> someTill printChar (char '"'))
       ) <|> pure Nothing
 
   spacesFollowingPackage <-
@@ -428,7 +427,7 @@ parseImport = (<?> "parseImport") $ do
               , spacesFollowingImport
               , fromMaybe "" maybeQualified
               , spacesFollowingQualified
-              , fromMaybe "" maybePackageName
+              , maybe "" (\packageName -> "\"" <> packageName <> "\"") maybePackageName
               , spacesFollowingPackage
               , moduleNameText
               , restOfLine
