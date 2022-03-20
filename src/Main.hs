@@ -813,7 +813,7 @@ parsePackageDumpPackage = do
     skipSomeTill
       (try skipLine)
       ( asum
-          [ (,True) <$> try parseExposedModules
+          [ (,True) <$> parseExposedModules
           , ([], False) <$ try packageEnd
           ]
       )
@@ -838,14 +838,17 @@ parsePackageDumpPackage = do
       string "exposed-modules:"
         >> (void eol <|> pure ())
         >> some
-             ( try
-                $ skipSome nonEolSpaceChar
-                >> sepBy1 parseModuleName nonEolSpaceChar
+             ( skipSome nonEolSpaceChar
+                >> sepBy1 (parseModuleName <* optional from <* optional ",") nonEolSpaceChar
                 <* eol
              )
              <&> concat
 
     packageEnd = try (string "---" >> (void eol <|> eof)) <|> eof
+
+    from = do
+      _ <- " from " 
+      some $ choice [ alphaNumChar, char '-', char ':', char '.' ]
 
 nonEolSpaceChar :: Parser ()
 nonEolSpaceChar =
