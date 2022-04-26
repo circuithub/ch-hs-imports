@@ -1,3 +1,4 @@
+{-# language BlockArguments #-}
 {-# language OverloadedStrings #-}
 {-# language FlexibleContexts #-}
 {-# language LambdaCase #-}
@@ -20,6 +21,7 @@ import Control.Arrow ((>>>))
 import Control.Monad
 import Data.Bifunctor (first, second, bimap)
 import qualified Data.Char as Char
+import Data.Either ( partitionEithers )
 import Data.Foldable
 import Data.Function
 import Data.Functor
@@ -617,7 +619,10 @@ projectModules filePath = do
       cabalFiles <-
         gatherFiles ".cabal" (takeDirectory cabalProjectFile)
 
-      traverse (localModules . unAbsoluteFilePath) cabalFiles <&> mconcat
+      (localPackages, modules) <-
+        traverse (localModules . unAbsoluteFilePath) cabalFiles <&> mconcat
+
+      pure (localPackages, removeLocalPackagePrefixes <$> modules)
 
     Nothing ->
       pure (Set.empty, MonoidalMap.empty)
@@ -853,3 +858,35 @@ parsePackageDumpPackage = do
 nonEolSpaceChar :: Parser ()
 nonEolSpaceChar =
   void $ notFollowedBy eol >> (spaceChar <|> char '\t')
+
+
+-- The way gatherFiles works is that it locates .hs files in the
+-- subdirectories of a directory with a .cabal file in it, but those
+-- subdirectories in turn have a .cabal file in it, then .hs files beneath
+-- that directory should not be treated as being part of the parent package.
+removeLocalPackagePrefixes :: NESet PackageSource -> NESet PackageSource
+removeLocalPackagePrefixes set = NESet.fromList packages'
+  where
+    packages = NESet.toList set
+    (locals, globals) = partitionPackages (toList packages)
+    locals' = removePrefixes cabalDir locals
+      where
+        cabalDir = takeDirectory . unAbsoluteFilePath . pathToCabalFile
+    packages' = fromMaybe packages $ NonEmpty.nonEmpty $
+      ALocalPackage <$> locals' <|> AGlobalPackage <$> globals
+
+
+partitionPackages :: [PackageSource] -> ([LocalPackage], [PackageName])
+partitionPackages = partitionEithers . map \case
+  ALocalPackage localPackage -> Left localPackage
+  AGlobalPackage globalPackage -> Right globalPackage
+
+
+removePrefixes :: Eq b => (a -> [b]) -> [a] -> [a]
+removePrefixes f input =
+  filter (\a -> none (f a `prefix`) (f <$> input)) input
+  where
+    prefix a b = case a `List.stripPrefix` b of
+      Just (_ : _) -> True
+      _ -> False
+    none = (not .) . any
