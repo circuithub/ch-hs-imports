@@ -658,30 +658,29 @@ localModules filePath = do
                 Right x -> pure x
           & liftIO
 
-      gatherFiles ".hs" (takeDirectory cabalPath)
+      let localPackage =
+            LocalPackage
+              { packageName =
+                  PackageName
+                    . Text.pack
+                    . takeBaseName
+                    $ cabalPath
+              , pathToCabalFile = AbsoluteFilePath cabalPath
+              , ..
+              }
+
+      moduleMap <- gatherFiles ".hs" (takeDirectory cabalPath)
         >>= parMapM (fmap (either (const Nothing) Just . parse parseModuleAndModuleName "") . (liftIO . Text.readFile) . unAbsoluteFilePath)
         <&> mapMaybe
               (fmap $ \moduleName ->
-                let localPackage =
-                      LocalPackage
-                        { packageName =
-                            PackageName
-                              . Text.pack
-                              . takeBaseName
-                              $ cabalPath
-                        , pathToCabalFile = AbsoluteFilePath cabalPath
-                        , ..
-                        }
-                in
-                  (  Set.singleton localPackage
-                  ,  MonoidalMap.singleton
-                      moduleName
-                      ( NESet.singleton (ALocalPackage localPackage)
-                      )
+                 MonoidalMap.singleton
+                  moduleName
+                  ( NESet.singleton (ALocalPackage localPackage)
                   )
-
               )
         <&> mconcat
+
+      pure (Set.singleton localPackage, moduleMap)
 
 
     Nothing ->
