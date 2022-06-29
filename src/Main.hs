@@ -29,6 +29,7 @@ import qualified Data.List as List
 import Data.List.NonEmpty (NonEmpty((:|)))
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe
+import Data.Ord (Down(Down))
 import Data.Tuple (swap)
 import Data.Void
 import GHC.Generics (Generic)
@@ -542,6 +543,10 @@ pickPackage (AbsoluteFilePath filePath) localPackages_ = NESet.toList >>> \case
                           takeDirectory pathToCabalFile `List.isPrefixOf` filePath
 
                   )
+              -- When we have a cabal project with anohter cabal project in a subdirectory
+              -- we need to take the longest matching path. That is match to the cabal project
+              -- closest to file.
+              & List.sortOn (Down . pathToCabalFile)
               & listToMaybe
 
           manyMatches
