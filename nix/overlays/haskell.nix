@@ -18,5 +18,5 @@ let
 in
 {
   inherit haskell;
-  #haskellPackages = self.haskell.packages.ghc881;
+  haskellPackages = self.haskell.packages.ghc922;
 }
