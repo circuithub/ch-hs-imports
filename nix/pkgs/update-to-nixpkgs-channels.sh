@@ -13,9 +13,9 @@ echo "updating to latest revision for channel $1"
 # script working directory
 SWD=$(dirname $(realpath "$0"))
 # get the revision from the current system's nixos version
-REV=$(git ls-remote https://github.com/NixOS/nixpkgs-channels "refs/heads/$1" | awk '{print $1}')
+REV=$(git ls-remote https://github.com/NixOS/nixpkgs "refs/heads/$1" | awk '{print $1}')
 # prefetch the revision and get its SHA
-HASH=$(nix-prefetch-url --unpack https://github.com/NixOS/nixpkgs-channels/archive/$REV.tar.gz)
+HASH=$(nix-prefetch-url --unpack https://github.com/NixOS/nixpkgs/archive/$REV.tar.gz)
 # update the revision in fetch.nix
 sed -i "/rev = \"/s/\".*/\"$REV\";/" $SWD/fetch.nix
 # update the sha in fetch.nix

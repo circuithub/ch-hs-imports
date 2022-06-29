@@ -26,6 +26,8 @@ let
         # extra useful dependencies
         pretty-show
         #rio
+        haskell-language-server
+        hie-bios
       ]
     );
   # the dependencies available in the shell
