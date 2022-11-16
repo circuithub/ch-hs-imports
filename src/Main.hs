@@ -385,7 +385,16 @@ parseImport = (<?> "parseImport") $ do
     (<?> "spacesFollowingImport") $
     Text.pack <$> some spaceChar
 
+  maybeSource <-
+    (<?> "maybeSource") $
+    try (Just <$> string "{-# SOURCE #-}") <|> 
+    try (Just <$> string "{-# source #-}") <|> 
+    pure Nothing
 
+  spacesFollowingSource <-
+    (<?> "spacesFollowingSource") $
+    Text.pack <$> many spaceChar
+ 
   maybeQualified <-
     (<?> "maybeQualified") $
     try (Just <$> string "qualified") <|> pure Nothing
@@ -428,6 +437,8 @@ parseImport = (<?> "parseImport") $ do
             (mconcat
               [ textImport
               , spacesFollowingImport
+              , fromMaybe "" maybeSource
+              , spacesFollowingSource
               , fromMaybe "" maybeQualified
               , spacesFollowingQualified
               , maybe "" (\packageName -> "\"" <> packageName <> "\"") maybePackageName
