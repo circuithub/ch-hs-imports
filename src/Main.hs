@@ -758,7 +758,7 @@ parseCabalDependencies :: Parser [PackageName]
 parseCabalDependencies = do
   colStartPos <-
     skipManyTill
-      (try otherLine)
+      otherLine
       (try parseBuildDependsStart)
 
   some (parsePackageName colStartPos)
