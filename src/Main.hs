@@ -770,7 +770,7 @@ parseCabalDependencies = do
     parseBuildDependsStart =
       space1
         >> (mkPos . (+1) . unPos . sourceColumn <$> getSourcePos)
-        <* (string "build-depends" >> space >> void (char ':') >> space)
+        <* (string' "build-depends" >> space >> void (char ':') >> space)
         <?> "parseBuildDependsStart"
 
     parsePackageName :: Pos -> Parser PackageName
@@ -852,10 +852,10 @@ parsePackageDumpPackage = do
     skipLine = manyTill (printChar <|> char '\t') eol
 
     parseName =
-      string "name:" >> skipSome nonEolSpaceChar >> someTill printChar eol
+      string' "name:" >> skipSome nonEolSpaceChar >> someTill printChar eol
 
     parseExposedModules =
-      string "exposed-modules:"
+      string' "exposed-modules:"
         >> (void eol <|> pure ())
         >> some
              ( skipSome nonEolSpaceChar
