@@ -737,7 +737,7 @@ gatherFiles extension =
           descendDirectory <|> checkFile
 
 parseModuleAndModuleName :: Parser ModuleName
-parseModuleAndModuleName = moduleName <|> (parseRestOfLine >> parseModuleAndModuleName)
+parseModuleAndModuleName = try moduleName <|> (parseRestOfLine >> parseModuleAndModuleName)
   where
     moduleName =
         string "module"
