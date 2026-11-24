@@ -787,30 +787,20 @@ componentsOfPackage directory description =
     , component Cabal.benchmarkBuildInfo . snd <$> Cabal.condBenchmarks description
     ]
   where
-    component :: (a -> Cabal.BuildInfo) -> Cabal.CondTree v [Cabal.Dependency] a -> CabalComponent
+    -- A component's tree holds its settings in every branch of its
+    -- conditionals, so folding over it collects them all.
+    component :: Foldable tree => (a -> Cabal.BuildInfo) -> tree a -> CabalComponent
     component getBuildInfo tree =
-      let nodes = condTreeNodes tree
-          buildInfos = map (getBuildInfo . Cabal.condTreeData) nodes
+      let buildInfos = map getBuildInfo (toList tree)
           sourceDirectories =
             case concatMap (map Cabal.getSymbolicPath . Cabal.hsSourceDirs) buildInfos of
               [] -> [asDirectory directory]
               relative -> map (asDirectory . (directory </>)) relative
           componentDependencies =
-            (concatMap Cabal.condTreeConstraints nodes <> concatMap Cabal.targetBuildDepends buildInfos)
+            concatMap Cabal.targetBuildDepends buildInfos
               & map (PackageName . Text.pack . Cabal.unPackageName . Cabal.depPkgName)
               & List.nub
       in CabalComponent {..}
-
-    -- The tree and every branch of its conditionals.
-    condTreeNodes :: Cabal.CondTree v c a -> [Cabal.CondTree v c a]
-    condTreeNodes tree =
-      tree
-        : concatMap
-            (\branch ->
-                condTreeNodes (Cabal.condBranchIfTrue branch)
-                  <> foldMap condTreeNodes (Cabal.condBranchIfFalse branch)
-            )
-            (Cabal.condTreeComponents tree)
 
 getPackageModulesFromGhcDump :: IO (MonoidalMap ModuleName (NESet PackageSource))
 getPackageModulesFromGhcDump = do
