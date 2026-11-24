@@ -13,6 +13,8 @@ executable ch-hs-imports
   build-depends :
    abstract-par,
    base,
+   bytestring,
+   Cabal-syntax,
    containers,
    deepseq,
    directory,
