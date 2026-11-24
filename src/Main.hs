@@ -517,14 +517,21 @@ asDirectory = addTrailingPathSeparator . normalise
 
 data PackageSource
   = ALocalPackage !LocalPackage
-  | AGlobalPackage !PackageName
+  | AGlobalPackage !PackageName !Exposure
+  deriving (Show, Eq, Ord, Generic, NFData)
+
+-- | How a package in GHC's package database exposes a module.
+data Exposure
+  = Defines
+  | ReExports
+    -- ^ Through @reexported-modules@, from another package.
   deriving (Show, Eq, Ord, Generic, NFData)
 
 newtype PackageName = PackageName {getPackageName :: Text} deriving (Eq, Ord, Show, Generic, NFData)
 
 packageNameFromSource :: PackageSource -> PackageName
 packageNameFromSource = \case
-  AGlobalPackage packageName ->  packageName
+  AGlobalPackage packageName _ ->  packageName
   ALocalPackage LocalPackage{packageName} ->  packageName
 
 determineModulePackage
@@ -557,7 +564,7 @@ pickPackage (AbsoluteFilePath filePath) localPackages_ = NESet.toList >>> \case
           manyMatches
             & NonEmpty.filter
                 (\case
-                    AGlobalPackage _ ->
+                    AGlobalPackage {} ->
                       False
 
                     ALocalPackage localPackage ->
@@ -587,14 +594,22 @@ pickPackage (AbsoluteFilePath filePath) localPackages_ = NESet.toList >>> \case
                   components -> components
               dependencies = foldMap componentDependencies fileComponents
 
-          manyMatches
-            & NonEmpty.filter
-                ( (`elem` dependencies)
-                    . packageNameFromSource
-                )
-            & \case
-                [x] -> Just (packageNameFromSource x)
-                _ -> Nothing
+          let inDependencies =
+                NonEmpty.filter ((`elem` dependencies) . packageNameFromSource) manyMatches
+              -- When a package re-exports the module from another that the
+              -- file also depends on, prefer the one that defines it.
+              defining =
+                List.filter
+                  (\case
+                      AGlobalPackage _ ReExports -> False
+                      _ -> True
+                  )
+                  inDependencies
+
+          case (inDependencies, defining) of
+            ([x], _) -> Just (packageNameFromSource x)
+            (_, [x]) -> Just (packageNameFromSource x)
+            _ -> Nothing
 
         fallBackMatch =
           manyMatches
@@ -824,10 +839,8 @@ parsePackageDump =
 
 parsePackageDumpPackage :: Parser (MonoidalMap ModuleName (NESet PackageSource))
 parsePackageDumpPackage = do
-  package_ <-
-    NESet.singleton
-      . AGlobalPackage
-      . PackageName
+  packageName_ <-
+    PackageName
       . Text.pack
       <$> parseName
 
@@ -846,7 +859,7 @@ parsePackageDumpPackage = do
 
   pure
     ( moduleNames
-        & map (, package_)
+        & map (second (NESet.singleton . AGlobalPackage packageName_))
         & MonoidalMap.fromListWith (<>)
     )
 
@@ -861,7 +874,13 @@ parsePackageDumpPackage = do
         >> (void eol <|> pure ())
         >> some
              ( skipSome nonEolSpaceChar
-                >> sepBy1 (parseModuleName <* optional from <* optional ",") nonEolSpaceChar
+                >> sepBy1
+                     ( (,)
+                         <$> parseModuleName
+                         <*> (maybe Defines (const ReExports) <$> optional from)
+                         <* optional ","
+                     )
+                     nonEolSpaceChar
                 <* eol
              )
              <&> concat
@@ -888,13 +907,13 @@ removeLocalPackagePrefixes set = NESet.fromList packages'
     (locals, globals) = partitionPackages (toList packages)
     locals' = removePrefixes packageDirectory locals
     packages' = fromMaybe packages $ NonEmpty.nonEmpty $
-      ALocalPackage <$> locals' <|> AGlobalPackage <$> globals
+      ALocalPackage <$> locals' <|> globals
 
 
-partitionPackages :: [PackageSource] -> ([LocalPackage], [PackageName])
+partitionPackages :: [PackageSource] -> ([LocalPackage], [PackageSource])
 partitionPackages = partitionEithers . map \case
   ALocalPackage localPackage -> Left localPackage
-  AGlobalPackage globalPackage -> Right globalPackage
+  globalPackage@AGlobalPackage {} -> Right globalPackage
 
 
 removePrefixes :: Eq b => (a -> [b]) -> [a] -> [a]
