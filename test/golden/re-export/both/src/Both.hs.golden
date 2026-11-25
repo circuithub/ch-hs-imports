@@ -1,0 +1,7 @@
+module Both where
+
+-- zeta
+import Zeta.Extra
+
+-- zeta-core
+import Zeta.Core

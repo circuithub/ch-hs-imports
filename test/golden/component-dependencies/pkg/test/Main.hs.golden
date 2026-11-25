@@ -1,0 +1,7 @@
+module Main (main) where
+
+-- beta
+import Shared
+
+main :: IO ()
+main = pure ()

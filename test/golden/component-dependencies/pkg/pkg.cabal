@@ -1,0 +1,16 @@
+cabal-version: 2.4
+name:          pkg
+version:       0
+
+library
+  hs-source-dirs: src
+  build-depends:  alpha
+
+common test-dependencies
+  build-depends: beta
+
+test-suite tests
+  import:         test-dependencies
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs

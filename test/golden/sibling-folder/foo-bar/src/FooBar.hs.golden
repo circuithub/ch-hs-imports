@@ -1,0 +1,4 @@
+module FooBar where
+
+-- beta
+import Shared

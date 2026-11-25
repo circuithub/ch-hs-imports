@@ -1,0 +1,1 @@
+packages: outer/outer.cabal outer/inner/inner.cabal
