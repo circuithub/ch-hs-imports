@@ -1,0 +1,9 @@
+name: alpha
+version: 1.0
+exposed-modules:
+    Shared
+---
+name: beta
+version: 1.0
+exposed-modules:
+    Shared

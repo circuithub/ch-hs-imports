@@ -1,0 +1,9 @@
+name: zeta
+version: 1.0
+exposed-modules:
+    Zeta.Extra, Zeta.Core from zeta-core-1.0-abc:Zeta.Core
+---
+name: zeta-core
+version: 1.0
+exposed-modules:
+    Zeta.Core

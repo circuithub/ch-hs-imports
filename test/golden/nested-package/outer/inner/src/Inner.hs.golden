@@ -1,0 +1,4 @@
+module Inner where
+
+-- beta
+import Shared

@@ -11,6 +11,11 @@
 {-# language DeriveGeneric #-}
 {-# language DeriveAnyClass #-}
 
+-- Cabal-syntax
+import qualified Distribution.PackageDescription as Cabal
+import qualified Distribution.PackageDescription.Parsec as Cabal
+import qualified Distribution.Utils.Path as Cabal
+
 -- abstract-par
 import Control.Monad.Par.Class (ParFuture)
 
@@ -35,6 +40,9 @@ import Data.Void
 import GHC.Generics (Generic)
 import Prelude hiding (takeWhile)
 import System.IO (stderr, hPutStrLn)
+
+-- bytestring
+import qualified Data.ByteString as ByteString
 
 -- containers
 import Data.Set (Set)
@@ -486,19 +494,44 @@ bol = (<?> "bol") $ do
 data LocalPackage = LocalPackage
   { packageName :: !PackageName
   , pathToCabalFile :: !AbsoluteFilePath
-  , cabalPackageDependencies :: ![PackageName]
+  , cabalComponents :: ![CabalComponent]
   } deriving (Show, Eq, Ord, Generic, NFData)
+
+-- | A library, executable, test suite or benchmark in a .cabal file.
+data CabalComponent = CabalComponent
+  { sourceDirectories :: ![FilePath]
+    -- ^ Absolute, ending with a path separator, as 'asDirectory' makes them.
+  , componentDependencies :: ![PackageName]
+    -- ^ From every branch of its conditionals and the common stanzas it
+    -- imports.
+  } deriving (Show, Eq, Ord, Generic, NFData)
+
+-- | The directory of a local package's .cabal file, as 'asDirectory' makes it.
+packageDirectory :: LocalPackage -> FilePath
+packageDirectory = asDirectory . takeDirectory . unAbsoluteFilePath . pathToCabalFile
+
+-- | A directory path ending with a path separator, so that it is a prefix only
+-- of the paths in that directory: @foo/@ is not a prefix of @foo-bar/Baz.hs@.
+asDirectory :: FilePath -> FilePath
+asDirectory = addTrailingPathSeparator . normalise
 
 data PackageSource
   = ALocalPackage !LocalPackage
-  | AGlobalPackage !PackageName
+  | AGlobalPackage !PackageName !Exposure
+  deriving (Show, Eq, Ord, Generic, NFData)
+
+-- | How a package in GHC's package database exposes a module.
+data Exposure
+  = Defines
+  | ReExports
+    -- ^ Through @reexported-modules@, from another package.
   deriving (Show, Eq, Ord, Generic, NFData)
 
 newtype PackageName = PackageName {getPackageName :: Text} deriving (Eq, Ord, Show, Generic, NFData)
 
 packageNameFromSource :: PackageSource -> PackageName
 packageNameFromSource = \case
-  AGlobalPackage packageName ->  packageName
+  AGlobalPackage packageName _ ->  packageName
   ALocalPackage LocalPackage{packageName} ->  packageName
 
 determineModulePackage
@@ -531,43 +564,52 @@ pickPackage (AbsoluteFilePath filePath) localPackages_ = NESet.toList >>> \case
           manyMatches
             & NonEmpty.filter
                 (\case
-                    AGlobalPackage _ ->
+                    AGlobalPackage {} ->
                       False
 
-                    ALocalPackage
-                      LocalPackage
-                        {pathToCabalFile = AbsoluteFilePath pathToCabalFile } ->
-                        takeDirectory pathToCabalFile `List.isPrefixOf` filePath
+                    ALocalPackage localPackage ->
+                      packageDirectory localPackage `List.isPrefixOf` filePath
                 )
             & \case
                 [x] -> Just (packageNameFromSource x)
                 _ -> Nothing
 
         cabalDependencyMatch = do
-          LocalPackage {cabalPackageDependencies} <-
+          LocalPackage {cabalComponents} <-
             localPackages_
               & Set.toList
-              & List.filter
-                  (\case
-                      LocalPackage
-                        {pathToCabalFile = AbsoluteFilePath pathToCabalFile } ->
-                          takeDirectory pathToCabalFile `List.isPrefixOf` filePath
-
-                  )
-              -- When we have a cabal project with anohter cabal project in a subdirectory
-              -- we need to take the longest matching path. That is match to the cabal project
+              & List.filter ((`List.isPrefixOf` filePath) . packageDirectory)
+              -- When we have a cabal project with another cabal project in a subdirectory
+              -- we need to take the deepest directory. That is match to the cabal project
               -- closest to file.
-              & List.sortOn (Down . pathToCabalFile)
+              & List.sortOn (Down . length . packageDirectory)
               & listToMaybe
 
-          manyMatches
-            & NonEmpty.filter
-                ( (`elem` cabalPackageDependencies)
-                    . packageNameFromSource
-                )
-            & \case
-                [x] -> Just (packageNameFromSource x)
-                _ -> Nothing
+          let -- The components whose source directories hold the file. A file
+              -- in none of them, such as Setup.hs, may use the dependencies
+              -- of any component.
+              fileComponents =
+                case List.filter (any (`List.isPrefixOf` filePath) . sourceDirectories) cabalComponents of
+                  [] -> cabalComponents
+                  components -> components
+              dependencies = foldMap componentDependencies fileComponents
+
+          let inDependencies =
+                NonEmpty.filter ((`elem` dependencies) . packageNameFromSource) manyMatches
+              -- When a package re-exports the module from another that the
+              -- file also depends on, prefer the one that defines it.
+              defining =
+                List.filter
+                  (\case
+                      AGlobalPackage _ ReExports -> False
+                      _ -> True
+                  )
+                  inDependencies
+
+          case (inDependencies, defining) of
+            ([x], _) -> Just (packageNameFromSource x)
+            (_, [x]) -> Just (packageNameFromSource x)
+            _ -> Nothing
 
         fallBackMatch =
           manyMatches
@@ -656,22 +698,16 @@ localModules filePath = do
   case mpathToCabalFile of
     Just (AbsoluteFilePath cabalPath) -> do
 
-      cabalPackageDependencies <-
-        Text.readFile cabalPath
-          <&> parse parseCabalDependencies  cabalPath
+      cabalComponents <-
+        ByteString.readFile cabalPath
+          <&> Cabal.parseGenericPackageDescriptionMaybe
           >>= \case
-                Left e ->
-                  hPutStrLn
-                        stderr
-                        ( unlines
-                            [ "Failed parsing dependencies from cabal file :"
-                            , errorBundlePretty e
-                            , "for file: "  ++ cabalPath
-                            ]
-                        )
+                Nothing ->
+                  hPutStrLn stderr ("Failed parsing cabal file: " ++ cabalPath)
                   $> []
 
-                Right x -> pure x
+                Just description ->
+                  pure (componentsOfPackage (takeDirectory cabalPath) description)
           & liftIO
 
       let localPackage =
@@ -754,51 +790,32 @@ absoluteFilePath :: (MonadIO m) => FilePath -> m AbsoluteFilePath
 absoluteFilePath = fmap AbsoluteFilePath . liftIO . makeAbsolute
 
 
-parseCabalDependencies :: Parser [PackageName]
-parseCabalDependencies = do
-  colStartPos <-
-    skipManyTill
-      otherLine
-      (try parseBuildDependsStart)
-
-  some (parsePackageName colStartPos)
-
+-- | The components in a package's .cabal file, which is in the given directory.
+componentsOfPackage :: FilePath -> Cabal.GenericPackageDescription -> [CabalComponent]
+componentsOfPackage directory description =
+  mconcat
+    [ component Cabal.libBuildInfo <$> toList (Cabal.condLibrary description)
+    , component Cabal.libBuildInfo . snd <$> Cabal.condSubLibraries description
+    , component Cabal.foreignLibBuildInfo . snd <$> Cabal.condForeignLibs description
+    , component Cabal.buildInfo . snd <$> Cabal.condExecutables description
+    , component Cabal.testBuildInfo . snd <$> Cabal.condTestSuites description
+    , component Cabal.benchmarkBuildInfo . snd <$> Cabal.condBenchmarks description
+    ]
   where
-    otherLine =
-      manyTill printChar (void eol <|> eof)
-
-    parseBuildDependsStart =
-      space1
-        >> (mkPos . (+1) . unPos . sourceColumn <$> getSourcePos)
-        <* (string' "build-depends" >> space >> void (char ':') >> space)
-        <?> "parseBuildDependsStart"
-
-    parsePackageName :: Pos -> Parser PackageName
-    parsePackageName leftBorder = do
-      try (space >> char ',' >> space)
-        <|> pure ()
-
-      pos <- sourceColumn <$> getSourcePos <?> "start column"
-
-      guard (leftBorder <= pos)
-        <?> "check start column"
-
-      PackageName . Text.pack
-        <$> ( (:)
-                <$> letterChar
-                <*> many
-                      ( choice
-                          [ alphaNumChar
-                          , char '-'
-                          , char '_'
-                          ]
-                      )
-                <* skipManyTill
-                     anySingle
-                     ( try (void eol)
-                         <|> (char ',' >> space)
-                     )
-            ) <?> "package name"
+    -- A component's tree holds its settings in every branch of its
+    -- conditionals, so folding over it collects them all.
+    component :: Foldable tree => (a -> Cabal.BuildInfo) -> tree a -> CabalComponent
+    component getBuildInfo tree =
+      let buildInfos = map getBuildInfo (toList tree)
+          sourceDirectories =
+            case concatMap (map Cabal.getSymbolicPath . Cabal.hsSourceDirs) buildInfos of
+              [] -> [asDirectory directory]
+              relative -> map (asDirectory . (directory </>)) relative
+          componentDependencies =
+            concatMap Cabal.targetBuildDepends buildInfos
+              & map (PackageName . Text.pack . Cabal.unPackageName . Cabal.depPkgName)
+              & List.nub
+      in CabalComponent {..}
 
 getPackageModulesFromGhcDump :: IO (MonoidalMap ModuleName (NESet PackageSource))
 getPackageModulesFromGhcDump = do
@@ -822,10 +839,8 @@ parsePackageDump =
 
 parsePackageDumpPackage :: Parser (MonoidalMap ModuleName (NESet PackageSource))
 parsePackageDumpPackage = do
-  package_ <-
-    NESet.singleton
-      . AGlobalPackage
-      . PackageName
+  packageName_ <-
+    PackageName
       . Text.pack
       <$> parseName
 
@@ -844,7 +859,7 @@ parsePackageDumpPackage = do
 
   pure
     ( moduleNames
-        & map (, package_)
+        & map (second (NESet.singleton . AGlobalPackage packageName_))
         & MonoidalMap.fromListWith (<>)
     )
 
@@ -859,7 +874,13 @@ parsePackageDumpPackage = do
         >> (void eol <|> pure ())
         >> some
              ( skipSome nonEolSpaceChar
-                >> sepBy1 (parseModuleName <* optional from <* optional ",") nonEolSpaceChar
+                >> sepBy1
+                     ( (,)
+                         <$> parseModuleName
+                         <*> (maybe Defines (const ReExports) <$> optional from)
+                         <* optional ","
+                     )
+                     nonEolSpaceChar
                 <* eol
              )
              <&> concat
@@ -884,17 +905,15 @@ removeLocalPackagePrefixes set = NESet.fromList packages'
   where
     packages = NESet.toList set
     (locals, globals) = partitionPackages (toList packages)
-    locals' = removePrefixes cabalDir locals
-      where
-        cabalDir = takeDirectory . unAbsoluteFilePath . pathToCabalFile
+    locals' = removePrefixes packageDirectory locals
     packages' = fromMaybe packages $ NonEmpty.nonEmpty $
-      ALocalPackage <$> locals' <|> AGlobalPackage <$> globals
+      ALocalPackage <$> locals' <|> globals
 
 
-partitionPackages :: [PackageSource] -> ([LocalPackage], [PackageName])
+partitionPackages :: [PackageSource] -> ([LocalPackage], [PackageSource])
 partitionPackages = partitionEithers . map \case
   ALocalPackage localPackage -> Left localPackage
-  AGlobalPackage globalPackage -> Right globalPackage
+  globalPackage@AGlobalPackage {} -> Right globalPackage
 
 
 removePrefixes :: Eq b => (a -> [b]) -> [a] -> [a]
